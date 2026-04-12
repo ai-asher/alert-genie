@@ -1,0 +1,76 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: alert-genie
+  namespace: monitoring
+  labels:
+    app: alert-genie
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: alert-genie
+  template:
+    metadata:
+      labels:
+        app: alert-genie
+    spec:
+      serviceAccountName: alert-genie
+      containers:
+        - name: alert-genie
+          image: alert-genie:latest
+          ports:
+            - containerPort: 8080
+              name: http
+          env:
+            - name: CLAUDE_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: alert-genie-secrets
+                  key: claude-api-key
+            - name: LARK_APP_ID
+              valueFrom:
+                secretKeyRef:
+                  name: alert-genie-secrets
+                  key: lark-app-id
+            - name: LARK_APP_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: alert-genie-secrets
+                  key: lark-app-secret
+            - name: LARK_VERIFICATION_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: alert-genie-secrets
+                  key: lark-verification-token
+          volumeMounts:
+            - name: config
+              mountPath: /etc/alert-genie
+              readOnly: true
+            - name: data
+              mountPath: /app/data
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: http
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+            limits:
+              cpu: 500m
+              memory: 512Mi
+      volumes:
+        - name: config
+          configMap:
+            name: alert-genie-config
+        - name: data
+          emptyDir: {}

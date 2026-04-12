@@ -1,0 +1,37 @@
+version: "3.8"
+
+services:
+  alert-genie:
+    build:
+      context: ..
+      dockerfile: deployments/Dockerfile
+    ports:
+      - "8080:8080"
+    volumes:
+      - ../configs/config.example.yaml:/etc/alert-genie/config.yaml:ro
+      - alertgenie-data:/app/data
+    environment:
+      - CLAUDE_API_KEY=${CLAUDE_API_KEY}
+      - LARK_APP_ID=${LARK_APP_ID}
+      - LARK_APP_SECRET=${LARK_APP_SECRET}
+      - LARK_VERIFICATION_TOKEN=${LARK_VERIFICATION_TOKEN}
+    depends_on:
+      - prometheus
+      - alertmanager
+
+  prometheus:
+    image: prom/prometheus:v2.51.0
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./prometheus.yml:/etc/prometheus/prometheus.yml:ro
+
+  alertmanager:
+    image: prom/alertmanager:v0.27.0
+    ports:
+      - "9093:9093"
+    volumes:
+      - ./alertmanager.yml:/etc/alertmanager/alertmanager.yml:ro
+
+volumes:
+  alertgenie-data:

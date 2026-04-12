@@ -1,0 +1,105 @@
+package store
+
+import (
+	"context"
+	"time"
+)
+
+type AlertRecord struct {
+	ID          string     `db:"id"`
+	Fingerprint string     `db:"fingerprint"`
+	AlertName   string     `db:"alert_name"`
+	Status      string     `db:"status"`
+	Severity    string     `db:"severity"`
+	Labels      string     `db:"labels"`
+	Annotations string     `db:"annotations"`
+	StartsAt    time.Time  `db:"starts_at"`
+	EndsAt      *time.Time `db:"ends_at"`
+	ReceivedAt  time.Time  `db:"received_at"`
+	GroupKey    string     `db:"group_key"`
+	PayloadJSON string     `db:"payload_json"`
+}
+
+type AnalysisRecord struct {
+	ID           string    `db:"id"`
+	AlertID      string    `db:"alert_id"`
+	Mode         string    `db:"mode"`
+	ResultJSON   string    `db:"result_json"`
+	ModelUsed    string    `db:"model_used"`
+	InputTokens  int       `db:"input_tokens"`
+	OutputTokens int       `db:"output_tokens"`
+	LatencyMs    int64     `db:"latency_ms"`
+	CreatedAt    time.Time `db:"created_at"`
+}
+
+type ApprovalRecord struct {
+	ID            string     `db:"id"`
+	AlertID       string     `db:"alert_id"`
+	PlanJSON      string     `db:"plan_json"`
+	Status        string     `db:"status"`
+	RequestedAt   time.Time  `db:"requested_at"`
+	RespondedAt   *time.Time `db:"responded_at"`
+	ApproverID    string     `db:"approver_id"`
+	ApproverName  string     `db:"approver_name"`
+	Comment       string     `db:"comment"`
+	LarkMessageID string     `db:"lark_message_id"`
+	ExpiresAt     time.Time  `db:"expires_at"`
+}
+
+type ExecutionLog struct {
+	ID          string     `db:"id"`
+	ApprovalID  string     `db:"approval_id"`
+	AlertID     string     `db:"alert_id"`
+	Step        int        `db:"step"`
+	CommandType string     `db:"command_type"`
+	Target      string     `db:"target"`
+	Command     string     `db:"command"`
+	Status      string     `db:"status"`
+	Output      string     `db:"output"`
+	Error       string     `db:"error"`
+	StartedAt   time.Time  `db:"started_at"`
+	FinishedAt  *time.Time `db:"finished_at"`
+	ExecutedBy  string     `db:"executed_by"`
+}
+
+type AlertFilter struct {
+	Status    *string
+	Severity  *string
+	AlertName *string
+	Since     *time.Time
+	Until     *time.Time
+	Limit     int
+	Offset    int
+}
+
+type ApprovalFilter struct {
+	Status *string
+	Limit  int
+	Offset int
+}
+
+// Store is the persistence interface. Implementations must be safe for concurrent use.
+type Store interface {
+	// Alert records
+	SaveAlert(ctx context.Context, alert *AlertRecord) error
+	GetAlert(ctx context.Context, id string) (*AlertRecord, error)
+	ListAlerts(ctx context.Context, filter AlertFilter) ([]*AlertRecord, error)
+
+	// Analysis records
+	SaveAnalysis(ctx context.Context, analysis *AnalysisRecord) error
+	GetAnalysis(ctx context.Context, alertID string) (*AnalysisRecord, error)
+
+	// Approval records
+	SaveApproval(ctx context.Context, approval *ApprovalRecord) error
+	GetApproval(ctx context.Context, id string) (*ApprovalRecord, error)
+	UpdateApprovalStatus(ctx context.Context, id string, status string, approverID string, comment string) error
+	ListApprovals(ctx context.Context, filter ApprovalFilter) ([]*ApprovalRecord, error)
+
+	// Execution logs
+	SaveExecutionLog(ctx context.Context, log *ExecutionLog) error
+	ListExecutionLogs(ctx context.Context, approvalID string) ([]*ExecutionLog, error)
+
+	// Lifecycle
+	Migrate(ctx context.Context) error
+	Close() error
+}

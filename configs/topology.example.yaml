@@ -1,0 +1,26 @@
+services:
+  - name: "user-api"
+    owner_team: "platform-team"
+    tier: "tier-1"
+    dependencies:
+      - name: "user-db"
+        type: "postgresql"
+        description: "Primary user database (RDS)"
+      - name: "redis-cache"
+        type: "redis"
+        description: "Session and user profile cache"
+    downstream:
+      - name: "web-frontend"
+        impact_if_unavailable: "Users cannot log in or view profiles"
+      - name: "order-service"
+        impact_if_unavailable: "Orders cannot validate user information"
+    known_failure_modes:
+      - mode: "High memory usage"
+        typical_cause: "Memory leak in user search, large result sets"
+        typical_resolution: "Restart pods, investigate query patterns"
+      - mode: "Connection pool exhaustion"
+        typical_cause: "Slow DB queries holding connections"
+        typical_resolution: "Kill idle connections, restart pods, check DB health"
+    custom_queries:
+      - 'http_request_duration_seconds{service="user-api"}'
+      - 'http_requests_total{service="user-api"}'
