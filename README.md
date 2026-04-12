@@ -1,3 +1,7 @@
+<p align="center">
+  <b>English</b> | <a href="README_zh.md">中文</a>
+</p>
+
 # Alert-Genie
 
 AI-powered alert analysis and self-healing middleware for Prometheus + Alertmanager.
@@ -67,7 +71,7 @@ Alert-Genie sits between Alertmanager and your notification channel (Lark/Feishu
 
 ```bash
 # Clone
-git clone https://github.com/laozhou333/alert-genie.git
+git clone https://github.com/ai-asher/alert-genie.git
 cd alert-genie
 
 # Build
