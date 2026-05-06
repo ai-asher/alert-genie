@@ -93,7 +93,12 @@ func (o *Orchestrator) HandleEvent(ctx context.Context, ev notifier.ChatEvent) e
 		userMsg.CreatedAt = time.Now()
 	}
 	if err := o.store.SaveMessage(ctx, userMsg); err != nil {
-		o.logger.Error("save user message failed", "error", err)
+		// History integrity matters: if we can't persist the user turn, abort
+		// the chat turn rather than continue and produce an inconsistent
+		// (assistant-without-user) history that future turns will read.
+		o.logger.Error("save user message failed, aborting chat turn", "error", err)
+		_, _ = o.notifier.SendReply(ctx, ev.MessageID, "暂存对话失败，请稍后重试。")
+		return err
 	}
 
 	// 3. Fetch original analysis + history
@@ -190,20 +195,58 @@ func (o *Orchestrator) loadOriginalContext(ctx context.Context, conv *store.Conv
 	return &result, alertText, nil
 }
 
+// History sizing constants. Tuned to keep input well under Claude's context
+// limit while still preserving useful context. Approximate 1 token ≈ 4 chars.
+const (
+	historyMaxTurns = 20    // last N message pairs/turns to keep
+	historyMaxChars = 60000 // ~15k tokens hard cap on combined history bytes
+)
+
 // buildHistory fetches prior messages, excluding the current user message.
+// Returns at most historyMaxTurns messages, totaling at most historyMaxChars
+// bytes. If the conversation is longer, the OLDEST messages are dropped
+// (recent context matters more than old context).
 func (o *Orchestrator) buildHistory(ctx context.Context, conversationID, currentMessageID string) ([]analyzer.ChatMessage, error) {
-	msgs, err := o.store.ListMessages(ctx, conversationID, 50)
+	// Fetch a window larger than the cap so we can trim to the most recent turns.
+	msgs, err := o.store.ListMessages(ctx, conversationID, historyMaxTurns*2)
 	if err != nil {
 		return nil, err
 	}
-	history := make([]analyzer.ChatMessage, 0, len(msgs))
+
+	// First pass: drop the just-saved current user message.
+	filtered := make([]*store.Message, 0, len(msgs))
 	for _, m := range msgs {
 		if m.LarkMessageID == currentMessageID {
-			continue // exclude the just-saved user message; it goes as the latest UserMessage
+			continue
+		}
+		filtered = append(filtered, m)
+	}
+
+	// Trim to last N turns.
+	if len(filtered) > historyMaxTurns {
+		filtered = filtered[len(filtered)-historyMaxTurns:]
+	}
+
+	// Trim by total char budget, dropping from the front (oldest first).
+	totalChars := 0
+	for _, m := range filtered {
+		totalChars += len(m.Content)
+	}
+	for totalChars > historyMaxChars && len(filtered) > 1 {
+		totalChars -= len(filtered[0].Content)
+		filtered = filtered[1:]
+	}
+
+	// If still over budget (single message too big), truncate that message body.
+	history := make([]analyzer.ChatMessage, 0, len(filtered))
+	for _, m := range filtered {
+		content := m.Content
+		if len(content) > historyMaxChars {
+			content = content[:historyMaxChars] + "...[truncated]"
 		}
 		history = append(history, analyzer.ChatMessage{
 			Role:    m.Role,
-			Content: m.Content,
+			Content: content,
 		})
 	}
 	return history, nil
@@ -249,6 +292,29 @@ func (o *Orchestrator) handleRevisedPlan(ctx context.Context, conv *store.Conver
 		_, _ = o.notifier.SendReply(ctx, ev.MessageID, "AI 表示要修改方案，但未生成有效的方案内容。")
 		return fmt.Errorf("revised_plan type but RevisedPlan is nil")
 	}
+
+	// If the previous approval is already approved/executing/completed/failed,
+	// generating a revised plan creates a confusing duplicate execution path.
+	// Bail out with a text reply instead.
+	if conv.ApprovalID != "" {
+		if prev, err := o.store.GetApproval(ctx, conv.ApprovalID); err == nil && prev != nil {
+			switch prev.Status {
+			case "approved", "executing":
+				_, _ = o.notifier.SendReply(ctx, ev.MessageID,
+					"原方案已批准并正在执行中，无法生成修订版。请等待执行结束后再讨论后续动作。")
+				return nil
+			case "completed":
+				_, _ = o.notifier.SendReply(ctx, ev.MessageID,
+					"原方案已执行完成，无需修订。如有新问题请触发新告警。")
+				return nil
+			case "failed":
+				_, _ = o.notifier.SendReply(ctx, ev.MessageID,
+					"原方案执行失败。建议先排查原因（查看 /api/v1/executions/{approval_id}），再决定是否重试。")
+				return nil
+			}
+		}
+	}
+
 	plan := resp.RevisedPlan
 
 	// Run safety validation on each command in the revised plan

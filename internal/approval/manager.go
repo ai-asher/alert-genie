@@ -91,6 +91,19 @@ func (m *manager) ProcessCallback(ctx context.Context, approvalID, action, userI
 		return fmt.Errorf("unknown action: %s", action)
 	}
 
+	// Friendly errors for known terminal states so the callback handler can
+	// surface them as Lark toasts rather than "invalid transition".
+	switch currentStatus {
+	case StatusSuperseded:
+		return fmt.Errorf("this plan has been superseded by a newer version — please act on the latest plan card")
+	case StatusExpired:
+		return fmt.Errorf("this approval has expired (TTL exceeded) — re-trigger the alert to get a fresh plan")
+	case StatusApproved, StatusExecuting, StatusCompleted, StatusFailed:
+		return fmt.Errorf("this plan is already %s and cannot be re-acted upon", currentStatus)
+	case StatusRejected:
+		return fmt.Errorf("this plan was already rejected")
+	}
+
 	// Validate state transition
 	if !currentStatus.CanTransitionTo(targetStatus) {
 		return fmt.Errorf("invalid transition from %s to %s", currentStatus, targetStatus)

@@ -12,10 +12,15 @@ import (
 	"github.com/alert-genie/alert-genie/internal/store"
 )
 
-// ProcessFunc is a callback invoked for each non-duplicate firing alert after
-// it has been persisted. The pipeline layer sets this to trigger analysis,
-// notification, etc.
-type ProcessFunc func(ctx context.Context, payload WebhookPayload)
+// PersistedAlert pairs an Alert with the database ID assigned to it.
+type PersistedAlert struct {
+	ID    string // UUID stored in alerts.id
+	Alert Alert
+}
+
+// ProcessFunc is a callback invoked once per webhook with all newly persisted
+// alerts. The pipeline layer sets this to trigger analysis, notification, etc.
+type ProcessFunc func(ctx context.Context, payload WebhookPayload, persisted []PersistedAlert)
 
 // Handler receives Alertmanager webhook requests, deduplicates, persists, and
 // dispatches them for further processing.
@@ -62,6 +67,8 @@ func (h *Handler) HandleWebhook(w http.ResponseWriter, r *http.Request) {
 		slog.String("groupKey", payload.GroupKey),
 		slog.Int("alertCount", len(payload.Alerts)),
 	)
+
+	persisted := make([]PersistedAlert, 0, len(payload.Alerts))
 
 	for _, a := range payload.Alerts {
 		if a.Status != "firing" {
@@ -136,10 +143,13 @@ func (h *Handler) HandleWebhook(w http.ResponseWriter, r *http.Request) {
 			slog.String("severity", a.Severity()),
 		)
 
-		// Dispatch to pipeline asynchronously.
-		if h.ProcessFunc != nil {
-			go h.ProcessFunc(r.Context(), payload)
-		}
+		persisted = append(persisted, PersistedAlert{ID: alertID, Alert: a})
+	}
+
+	// Dispatch all persisted alerts at once with their UUIDs.
+	// Detach from r.Context so handler can return 200 immediately and pipeline keeps running.
+	if h.ProcessFunc != nil && len(persisted) > 0 {
+		go h.ProcessFunc(context.Background(), payload, persisted)
 	}
 
 	// Alertmanager expects a fast 200 OK.

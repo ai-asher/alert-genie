@@ -136,6 +136,12 @@ type Store interface {
 	GetMessageByLarkID(ctx context.Context, larkMessageID string) (*Message, error)
 	ListMessages(ctx context.Context, conversationID string, limit int) ([]*Message, error)
 
+	// Event idempotency. MarkEventProcessed inserts the event_id; returns true if
+	// this was the first time (caller should proceed), false if already processed
+	// (caller should skip).
+	MarkEventProcessed(ctx context.Context, eventID string) (firstTime bool, err error)
+	PurgeOldEvents(ctx context.Context, olderThan time.Time) (int, error)
+
 	// Lifecycle
 	Migrate(ctx context.Context) error
 	Close() error

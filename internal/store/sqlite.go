@@ -42,14 +42,17 @@ func NewSQLite(path string) (Store, error) {
 }
 
 func (s *sqliteStore) Migrate(ctx context.Context) error {
-	migrations := []string{"migrations/001_init.sql", "migrations/002_chat.sql"}
+	migrations := []string{
+		"migrations/001_init.sql",
+		"migrations/002_chat_alter.sql", // ALTER TABLE — may fail on re-run, tolerated
+		"migrations/003_chat_tables.sql",
+	}
 	for _, m := range migrations {
 		data, err := migrationsFS.ReadFile(m)
 		if err != nil {
 			return fmt.Errorf("read migration %s: %w", m, err)
 		}
 		if _, err := s.db.ExecContext(ctx, string(data)); err != nil {
-			// SQLite ALTER TABLE will fail on re-run if column exists; tolerate it
 			if !isAlreadyExistsErr(err) {
 				return fmt.Errorf("run migration %s: %w", m, err)
 			}
@@ -290,9 +293,16 @@ func (s *sqliteStore) ListExecutionLogs(ctx context.Context, approvalID string) 
 // Conversations
 
 func (s *sqliteStore) SaveConversation(ctx context.Context, c *Conversation) error {
+	// Upsert by root_message_id (UNIQUE). If a conversation already exists for
+	// this root, update approval_id/updated_at instead of failing — this
+	// matters when pipeline re-sends the same card message_id (rare) or when
+	// the migration's UNIQUE constraint kicks in on a duplicate insert.
 	_, err := s.db.ExecContext(ctx,
 		`INSERT INTO conversations (id, alert_id, approval_id, lark_chat_id, root_message_id, created_at, updated_at)
-		 VALUES (?, ?, ?, ?, ?, ?, ?)`,
+		 VALUES (?, ?, ?, ?, ?, ?, ?)
+		 ON CONFLICT(root_message_id) DO UPDATE SET
+		   approval_id = COALESCE(NULLIF(excluded.approval_id, ''), conversations.approval_id),
+		   updated_at = excluded.updated_at`,
 		c.ID, c.AlertID, c.ApprovalID, c.LarkChatID, c.RootMessageID, c.CreatedAt, c.UpdatedAt,
 	)
 	return err
@@ -386,4 +396,30 @@ func (s *sqliteStore) ListMessages(ctx context.Context, conversationID string, l
 		msgs = append(msgs, m)
 	}
 	return msgs, rows.Err()
+}
+
+// Event idempotency
+
+func (s *sqliteStore) MarkEventProcessed(ctx context.Context, eventID string) (bool, error) {
+	res, err := s.db.ExecContext(ctx,
+		`INSERT OR IGNORE INTO processed_events (event_id, processed_at) VALUES (?, ?)`,
+		eventID, time.Now())
+	if err != nil {
+		return false, err
+	}
+	rows, err := res.RowsAffected()
+	if err != nil {
+		return false, err
+	}
+	return rows > 0, nil
+}
+
+func (s *sqliteStore) PurgeOldEvents(ctx context.Context, olderThan time.Time) (int, error) {
+	res, err := s.db.ExecContext(ctx,
+		`DELETE FROM processed_events WHERE processed_at < ?`, olderThan)
+	if err != nil {
+		return 0, err
+	}
+	n, err := res.RowsAffected()
+	return int(n), err
 }

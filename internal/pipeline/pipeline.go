@@ -63,19 +63,17 @@ func New(
 }
 
 // ProcessAlert is the main entry point called by the alert handler's ProcessFunc.
-// Each alert in the payload is processed asynchronously.
-func (p *Pipeline) ProcessAlert(ctx context.Context, payload alert.WebhookPayload) {
-	for _, a := range payload.Alerts {
-		if a.Status != "firing" {
-			continue
-		}
-		go p.processOne(context.Background(), a, payload)
+// Each alert in the payload is processed asynchronously with its assigned UUID.
+func (p *Pipeline) ProcessAlert(ctx context.Context, payload alert.WebhookPayload, persisted []alert.PersistedAlert) {
+	for _, pa := range persisted {
+		go p.processOne(context.Background(), pa.ID, pa.Alert, payload)
 	}
 }
 
-func (p *Pipeline) processOne(ctx context.Context, a alert.Alert, payload alert.WebhookPayload) {
+func (p *Pipeline) processOne(ctx context.Context, alertID string, a alert.Alert, payload alert.WebhookPayload) {
 	alertName := a.AlertName()
 	p.logger.Info("pipeline processing alert",
+		"alert_id", alertID,
 		"alertname", alertName,
 		"severity", a.Severity(),
 	)
@@ -129,7 +127,7 @@ func (p *Pipeline) processOne(ctx context.Context, a alert.Alert, payload alert.
 	analysisJSON, _ := json.Marshal(result)
 	p.store.SaveAnalysis(ctx, &store.AnalysisRecord{
 		ID:           generateID(),
-		AlertID:      a.Fingerprint,
+		AlertID:      alertID,
 		Mode:         p.cfg.Mode,
 		ResultJSON:   string(analysisJSON),
 		ModelUsed:    result.ModelUsed,
@@ -150,7 +148,7 @@ func (p *Pipeline) processOne(ctx context.Context, a alert.Alert, payload alert.
 			return
 		}
 		// Create conversation so users can @Bot to ask follow-up questions
-		p.createConversation(ctx, a.Fingerprint, "", msgID)
+		p.createConversation(ctx, alertID, "", msgID)
 		return
 	}
 
@@ -196,13 +194,13 @@ func (p *Pipeline) processOne(ctx context.Context, a alert.Alert, payload alert.
 	// 10. Create approval record
 	planJSON, _ := json.Marshal(plan)
 	approvalID, err := p.approval.CreateApproval(ctx,
-		a.Fingerprint, string(planJSON), msgID, p.cfg.Approval.TTL)
+		alertID, string(planJSON), msgID, p.cfg.Approval.TTL)
 	if err != nil {
 		p.logger.Error("failed to create approval", "error", err)
 	}
 
 	// 11. Create conversation so users can @Bot to ask follow-ups
-	p.createConversation(ctx, a.Fingerprint, approvalID, msgID)
+	p.createConversation(ctx, alertID, approvalID, msgID)
 
 	p.logger.Info("healing plan sent for approval",
 		"alertname", alertName,
@@ -256,7 +254,8 @@ func (p *Pipeline) HandleApprovalCallback(ctx context.Context, approvalID, actio
 	return nil
 }
 
-// StartExpireLoop starts a background goroutine that periodically expires stale approvals.
+// StartExpireLoop starts a background goroutine that periodically expires stale approvals
+// and purges old processed_events idempotency records.
 func (p *Pipeline) StartExpireLoop(ctx context.Context) {
 	ticker := time.NewTicker(p.cfg.Approval.ExpireCheckInterval)
 	go func() {
@@ -271,6 +270,15 @@ func (p *Pipeline) StartExpireLoop(ctx context.Context) {
 					p.logger.Error("expire stale approvals failed", "error", err)
 				} else if expired > 0 {
 					p.logger.Info("expired stale approvals", "count", expired)
+				}
+
+				// Purge processed_events older than 24h. Lark won't retry an event
+				// that long after delivery, so this window is more than enough.
+				purged, err := p.store.PurgeOldEvents(ctx, time.Now().Add(-24*time.Hour))
+				if err != nil {
+					p.logger.Error("purge old events failed", "error", err)
+				} else if purged > 0 {
+					p.logger.Debug("purged old events", "count", purged)
 				}
 			}
 		}

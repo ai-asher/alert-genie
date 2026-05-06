@@ -28,6 +28,13 @@ type ChatEvent struct {
 	MentionedBot    bool
 }
 
+// EventDeduper is implemented by anything that can claim an event ID for
+// idempotent processing. MarkProcessed returns true if this is the first time
+// the event_id has been seen, false if it was already processed.
+type EventDeduper interface {
+	MarkEventProcessed(ctx context.Context, eventID string) (bool, error)
+}
+
 // EventHandler handles inbound Lark events delivered to the event subscription
 // endpoint. It is intentionally separate from CallbackHandler — the two
 // endpoints use different request formats and serve different purposes.
@@ -39,6 +46,7 @@ type EventHandler struct {
 	verificationToken string
 	botOpenID         string // optional, used to detect self-messages and bot mentions
 	botName           string // optional, used as fallback to detect bot mentions
+	deduper           EventDeduper
 	ProcessFunc       func(ctx context.Context, ev ChatEvent) error
 }
 
@@ -46,14 +54,18 @@ type EventHandler struct {
 //
 // botOpenID and botName are optional. If both are empty, MentionedBot on the
 // emitted ChatEvent will be inferred from whether the message has any mentions
-// at all (Lark only delivers group messages to a bot when the bot is mentioned
-// or the chat is configured to deliver everything, so this is a reasonable
-// best-effort fallback).
-func NewEventHandler(verificationToken, botOpenID, botName string, processFunc func(ctx context.Context, ev ChatEvent) error) *EventHandler {
+// at all.
+//
+// deduper is required: Lark retries event delivery on network errors and on
+// timeouts; without idempotency the same event_id will trigger ProcessFunc
+// multiple times. Pass a store-backed implementation in production. Tests may
+// pass a no-op (always returning true) impl.
+func NewEventHandler(verificationToken, botOpenID, botName string, deduper EventDeduper, processFunc func(ctx context.Context, ev ChatEvent) error) *EventHandler {
 	return &EventHandler{
 		verificationToken: verificationToken,
 		botOpenID:         botOpenID,
 		botName:           botName,
+		deduper:           deduper,
 		ProcessFunc:       processFunc,
 	}
 }
@@ -235,18 +247,39 @@ func (h *EventHandler) HandleEvent(w http.ResponseWriter, r *http.Request) {
 		MentionedBot:    mentioned,
 	}
 
-	// Ack Lark immediately; ProcessFunc errors are logged, not surfaced.
+	// Idempotency: claim the event_id. Lark retries on network errors and timeouts;
+	// without this, the same event triggers ProcessFunc multiple times.
+	if h.deduper != nil && ev.EventID != "" {
+		firstTime, err := h.deduper.MarkEventProcessed(r.Context(), ev.EventID)
+		if err != nil {
+			slog.Error("dedupe event failed, processing anyway",
+				"err", err, "event_id", ev.EventID)
+		} else if !firstTime {
+			slog.Debug("duplicate event ignored", "event_id", ev.EventID)
+			w.WriteHeader(http.StatusOK)
+			return
+		}
+	}
+
+	// Ack Lark immediately so we stay within their 3-second deadline. ProcessFunc
+	// runs asynchronously in a detached context so it survives this handler's
+	// request scope (Go cancels r.Context() when the handler returns).
 	w.WriteHeader(http.StatusOK)
 
 	if h.ProcessFunc == nil {
 		return
 	}
-	if err := h.ProcessFunc(r.Context(), ev); err != nil {
-		slog.Error("process chat event failed",
-			"err", err,
-			"event_id", ev.EventID,
-			"message_id", ev.MessageID)
-	}
+
+	go func(ev ChatEvent) {
+		ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
+		defer cancel()
+		if err := h.ProcessFunc(ctx, ev); err != nil {
+			slog.Error("process chat event failed",
+				"err", err,
+				"event_id", ev.EventID,
+				"message_id", ev.MessageID)
+		}
+	}(ev)
 }
 
 // parseLarkMillis parses a Lark timestamp string (milliseconds since epoch) to

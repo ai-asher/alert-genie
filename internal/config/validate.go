@@ -33,6 +33,15 @@ func validate(cfg *Config) error {
 		return fmt.Errorf("lark.alert_chat_id is required")
 	}
 
+	if cfg.Lark.ChatEnabled {
+		if cfg.Lark.BotOpenID == "" {
+			return fmt.Errorf("lark.bot_open_id is required when lark.chat_enabled is true (otherwise mention detection cannot reliably distinguish @Bot from @user)")
+		}
+		if cfg.Lark.VerificationToken == "" {
+			return fmt.Errorf("lark.verification_token is required when lark.chat_enabled is true (used to authenticate event subscription callbacks)")
+		}
+	}
+
 	if cfg.Store.Driver != "sqlite" && cfg.Store.Driver != "postgres" {
 		return fmt.Errorf("store.driver must be 'sqlite' or 'postgres', got %q", cfg.Store.Driver)
 	}

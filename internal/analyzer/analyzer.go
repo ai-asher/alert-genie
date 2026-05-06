@@ -329,14 +329,96 @@ func parseAnalysisResult(text string) (*AnalysisResult, error) {
 }
 
 // parseChatResponse extracts a JSON ChatResponse from the LLM text output,
-// tolerating markdown code fences just like parseAnalysisResult.
+// tolerating markdown code fences. On parse failure, returns a best-effort
+// text response carrying the raw LLM output so the user still gets SOMETHING
+// rather than an opaque error. This matters because a malformed JSON would
+// otherwise turn a "the LLM rambled instead of returning JSON" into an outage
+// from the user's perspective.
 func parseChatResponse(text string) (*ChatResponse, error) {
 	cleaned := stripCodeFences(text)
-	var result ChatResponse
-	if err := json.Unmarshal([]byte(cleaned), &result); err != nil {
-		return nil, fmt.Errorf("unmarshal chat JSON from LLM output: %w (raw text starts with: %.100s)", err, cleaned)
+
+	// Best-effort: extract the first balanced top-level JSON object from
+	// the cleaned text in case the LLM emitted prose around the JSON.
+	if extracted := extractFirstJSONObject(cleaned); extracted != "" {
+		cleaned = extracted
 	}
-	return &result, nil
+
+	var result ChatResponse
+	if err := json.Unmarshal([]byte(cleaned), &result); err == nil {
+		// Validate type field has a known value
+		if result.Type != ChatResponseText && result.Type != ChatResponseRevisedPlan {
+			return degradeToText(text, "LLM returned an unrecognized response type"), nil
+		}
+		// If type is revised_plan but RevisedPlan is missing/empty, degrade
+		if result.Type == ChatResponseRevisedPlan && (result.RevisedPlan == nil || len(result.RevisedPlan.Commands) == 0) {
+			return degradeToText(text, "LLM indicated a revised plan but did not produce one"), nil
+		}
+		return &result, nil
+	}
+
+	// JSON parse failed entirely. Surface the raw model output as a text
+	// reply rather than failing the chat turn.
+	return degradeToText(text, "I had trouble formatting my response"), nil
+}
+
+// degradeToText wraps raw LLM output (or a fallback message) in a
+// well-formed text-type ChatResponse.
+func degradeToText(rawLLMOutput, prefix string) *ChatResponse {
+	const maxRaw = 2000
+	body := strings.TrimSpace(rawLLMOutput)
+	if len(body) > maxRaw {
+		body = body[:maxRaw] + "...[truncated]"
+	}
+	content := prefix
+	if body != "" {
+		content = prefix + ":\n\n" + body
+	}
+	return &ChatResponse{
+		Type:        ChatResponseText,
+		TextContent: content,
+		Summary:     prefix,
+	}
+}
+
+// extractFirstJSONObject finds the first balanced `{...}` substring in s.
+// Returns "" if no balanced object is found. Naive but good enough for
+// stripping prose that wraps a JSON object.
+func extractFirstJSONObject(s string) string {
+	start := strings.Index(s, "{")
+	if start < 0 {
+		return ""
+	}
+	depth := 0
+	inStr := false
+	escaped := false
+	for i := start; i < len(s); i++ {
+		c := s[i]
+		if escaped {
+			escaped = false
+			continue
+		}
+		if c == '\\' {
+			escaped = true
+			continue
+		}
+		if c == '"' {
+			inStr = !inStr
+			continue
+		}
+		if inStr {
+			continue
+		}
+		switch c {
+		case '{':
+			depth++
+		case '}':
+			depth--
+			if depth == 0 {
+				return s[start : i+1]
+			}
+		}
+	}
+	return ""
 }
 
 // stripCodeFences removes a single surrounding markdown code fence (with an

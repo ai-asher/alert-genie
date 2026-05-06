@@ -46,8 +46,9 @@ lark:
   encryption_key: "${LARK_ENCRYPT_KEY}"
   alert_chat_id: "oc_xxxxxxxxxx"
   callback_url: "https://alert-genie.example.com/api/v1/lark/callback"
-  # Optional: bot's open_id for self-message detection and @mention detection.
-  # Without this, ANY @mention in the chat will be treated as targeting the bot.
+  # Multi-turn @Bot conversations (in-card replies). Disabled by default.
+  # When enabled, bot_open_id is REQUIRED so we can reliably detect @Bot vs @user.
+  chat_enabled: false
   bot_open_id: "ou_xxxxxxxxxx"
   bot_name: "Alert-Genie"
 

@@ -139,21 +139,27 @@ func main() {
 	// Initialize chat orchestrator (multi-turn conversations triggered by @Bot)
 	chatOrchestrator := chat.New(st, az, larkNotifier, am, sv, cfg.Approval.TTL, logger)
 
-	// Initialize Lark event handler (group chat messages, @Bot mentions)
-	eventHandler := notifier.NewEventHandler(
-		cfg.Lark.VerificationToken,
-		cfg.Lark.BotOpenID,
-		cfg.Lark.BotName,
-		chatOrchestrator.HandleEvent,
-	)
-
 	// Initialize server
 	srv := server.New(cfg, st, logger)
 
 	// Register additional routes on the server's router
 	srv.Router().Post("/api/v1/alerts", alertHandler.HandleWebhook)
 	srv.Router().Post("/api/v1/lark/callback", callbackHandler.HandleCallback)
-	srv.Router().Post("/api/v1/lark/events", eventHandler.HandleEvent)
+
+	// Conditionally register the chat event endpoint
+	if cfg.Lark.ChatEnabled {
+		eventHandler := notifier.NewEventHandler(
+			cfg.Lark.VerificationToken,
+			cfg.Lark.BotOpenID,
+			cfg.Lark.BotName,
+			st, // store implements EventDeduper via MarkEventProcessed
+			chatOrchestrator.HandleEvent,
+		)
+		srv.Router().Post("/api/v1/lark/events", eventHandler.HandleEvent)
+		logger.Info("@Bot chat enabled", "bot_open_id", cfg.Lark.BotOpenID)
+	} else {
+		logger.Info("@Bot chat disabled (set lark.chat_enabled: true to enable)")
+	}
 
 	// Start background tasks
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)

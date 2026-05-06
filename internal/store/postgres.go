@@ -31,7 +31,11 @@ func NewPostgres(dsn string, maxOpen, maxIdle int, maxLifetime time.Duration) (S
 }
 
 func (s *postgresStore) Migrate(ctx context.Context) error {
-	migrations := []string{"migrations/001_init.sql", "migrations/002_chat.sql"}
+	migrations := []string{
+		"migrations/001_init.sql",
+		"migrations/002_chat_alter.sql", // ALTER TABLE — may fail on re-run, tolerated
+		"migrations/003_chat_tables.sql",
+	}
 	for _, m := range migrations {
 		data, err := migrationsFS.ReadFile(m)
 		if err != nil {
@@ -271,7 +275,10 @@ func (s *postgresStore) ListExecutionLogs(ctx context.Context, approvalID string
 func (s *postgresStore) SaveConversation(ctx context.Context, c *Conversation) error {
 	_, err := s.db.ExecContext(ctx,
 		`INSERT INTO conversations (id, alert_id, approval_id, lark_chat_id, root_message_id, created_at, updated_at)
-		 VALUES ($1, $2, $3, $4, $5, $6, $7)`,
+		 VALUES ($1, $2, $3, $4, $5, $6, $7)
+		 ON CONFLICT (root_message_id) DO UPDATE SET
+		   approval_id = COALESCE(NULLIF(EXCLUDED.approval_id, ''), conversations.approval_id),
+		   updated_at = EXCLUDED.updated_at`,
 		c.ID, c.AlertID, c.ApprovalID, c.LarkChatID, c.RootMessageID, c.CreatedAt, c.UpdatedAt,
 	)
 	return err
@@ -365,4 +372,30 @@ func (s *postgresStore) ListMessages(ctx context.Context, conversationID string,
 		msgs = append(msgs, m)
 	}
 	return msgs, rows.Err()
+}
+
+// Event idempotency
+
+func (s *postgresStore) MarkEventProcessed(ctx context.Context, eventID string) (bool, error) {
+	res, err := s.db.ExecContext(ctx,
+		`INSERT INTO processed_events (event_id, processed_at) VALUES ($1, $2) ON CONFLICT (event_id) DO NOTHING`,
+		eventID, time.Now())
+	if err != nil {
+		return false, err
+	}
+	rows, err := res.RowsAffected()
+	if err != nil {
+		return false, err
+	}
+	return rows > 0, nil
+}
+
+func (s *postgresStore) PurgeOldEvents(ctx context.Context, olderThan time.Time) (int, error) {
+	res, err := s.db.ExecContext(ctx,
+		`DELETE FROM processed_events WHERE processed_at < $1`, olderThan)
+	if err != nil {
+		return 0, err
+	}
+	n, err := res.RowsAffected()
+	return int(n), err
 }
