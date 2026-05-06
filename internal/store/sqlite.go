@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
 	_ "github.com/mattn/go-sqlite3"
@@ -46,6 +47,7 @@ func (s *sqliteStore) Migrate(ctx context.Context) error {
 		"migrations/001_init.sql",
 		"migrations/002_chat_alter.sql", // ALTER TABLE — may fail on re-run, tolerated
 		"migrations/003_chat_tables.sql",
+		"migrations/004_feedback.sql",
 	}
 	for _, m := range migrations {
 		data, err := migrationsFS.ReadFile(m)
@@ -422,4 +424,139 @@ func (s *sqliteStore) PurgeOldEvents(ctx context.Context, olderThan time.Time) (
 	}
 	n, err := res.RowsAffected()
 	return int(n), err
+}
+
+// Incident feedback
+
+func (s *sqliteStore) SaveFeedback(ctx context.Context, fb *IncidentFeedback) error {
+	_, err := s.db.ExecContext(ctx,
+		`INSERT INTO incident_feedback (id, alert_id, approval_id, rating, comment, user_open_id, user_name, lark_message_id, created_at)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		fb.ID, fb.AlertID, fb.ApprovalID, fb.Rating, fb.Comment,
+		fb.UserOpenID, fb.UserName, fb.LarkMessageID, fb.CreatedAt,
+	)
+	return err
+}
+
+func (s *sqliteStore) ListFeedback(ctx context.Context, alertID string) ([]*IncidentFeedback, error) {
+	rows, err := s.db.QueryContext(ctx,
+		`SELECT id, alert_id, COALESCE(approval_id, ''), rating, COALESCE(comment, ''),
+		        COALESCE(user_open_id, ''), COALESCE(user_name, ''), COALESCE(lark_message_id, ''), created_at
+		 FROM incident_feedback WHERE alert_id = ? ORDER BY created_at ASC`, alertID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var fbs []*IncidentFeedback
+	for rows.Next() {
+		fb := &IncidentFeedback{}
+		if err := rows.Scan(&fb.ID, &fb.AlertID, &fb.ApprovalID, &fb.Rating, &fb.Comment,
+			&fb.UserOpenID, &fb.UserName, &fb.LarkMessageID, &fb.CreatedAt); err != nil {
+			return nil, err
+		}
+		fbs = append(fbs, fb)
+	}
+	return fbs, rows.Err()
+}
+
+func (s *sqliteStore) UpsertOutcome(ctx context.Context, o *AlertOutcome) error {
+	_, err := s.db.ExecContext(ctx,
+		`INSERT INTO alert_outcomes (alert_id, final_approval_status, feedback_summary, resolved_via, updated_at)
+		 VALUES (?, ?, ?, ?, ?)
+		 ON CONFLICT(alert_id) DO UPDATE SET
+		   final_approval_status = COALESCE(NULLIF(excluded.final_approval_status, ''), alert_outcomes.final_approval_status),
+		   feedback_summary = COALESCE(NULLIF(excluded.feedback_summary, ''), alert_outcomes.feedback_summary),
+		   resolved_via = COALESCE(NULLIF(excluded.resolved_via, ''), alert_outcomes.resolved_via),
+		   updated_at = excluded.updated_at`,
+		o.AlertID, o.FinalApprovalStatus, o.FeedbackSummary, o.ResolvedVia, o.UpdatedAt,
+	)
+	return err
+}
+
+func (s *sqliteStore) GetOutcome(ctx context.Context, alertID string) (*AlertOutcome, error) {
+	row := s.db.QueryRowContext(ctx,
+		`SELECT alert_id, COALESCE(final_approval_status, ''), COALESCE(feedback_summary, ''),
+		        COALESCE(resolved_via, ''), updated_at
+		 FROM alert_outcomes WHERE alert_id = ?`, alertID)
+	o := &AlertOutcome{}
+	err := row.Scan(&o.AlertID, &o.FinalApprovalStatus, &o.FeedbackSummary, &o.ResolvedVia, &o.UpdatedAt)
+	if err == sql.ErrNoRows {
+		return nil, nil
+	}
+	return o, err
+}
+
+// Historical retrieval
+
+func (s *sqliteStore) FindHistoricalCandidates(ctx context.Context, q HistoricalQuery) ([]*HistoricalCandidate, error) {
+	limit := q.Limit
+	if limit <= 0 {
+		limit = 50
+	}
+
+	// Strategy: pull candidates by alertname (preferred) OR by labels match,
+	// joined with the latest analysis. We deliberately don't try to score
+	// "similarity" here — that's the LLM ranker's job. We just hand it a
+	// fresh, recent slice of candidate incidents.
+	args := []any{}
+	where := []string{"1=1"}
+
+	if q.AlertName != "" {
+		where = append(where, "a.alert_name = ?")
+		args = append(args, q.AlertName)
+	}
+	if q.ExcludeAlertID != "" {
+		where = append(where, "a.id <> ?")
+		args = append(args, q.ExcludeAlertID)
+	}
+	if q.Since != nil {
+		where = append(where, "a.received_at >= ?")
+		args = append(args, *q.Since)
+	}
+
+	query := `
+		SELECT
+		    a.id,
+		    a.fingerprint,
+		    a.alert_name,
+		    a.severity,
+		    a.starts_at,
+		    a.labels,
+		    a.annotations,
+		    COALESCE(an.result_json, ''),
+		    COALESCE(o.final_approval_status, ''),
+		    COALESCE(o.feedback_summary, ''),
+		    COALESCE(o.resolved_via, '')
+		FROM alerts a
+		LEFT JOIN (
+		    SELECT alert_id, result_json,
+		           ROW_NUMBER() OVER (PARTITION BY alert_id ORDER BY created_at DESC) AS rn
+		    FROM analyses
+		) an ON an.alert_id = a.id AND an.rn = 1
+		LEFT JOIN alert_outcomes o ON o.alert_id = a.id
+		WHERE ` + strings.Join(where, " AND ") + `
+		ORDER BY a.received_at DESC
+		LIMIT ?
+	`
+	args = append(args, limit)
+
+	rows, err := s.db.QueryContext(ctx, query, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var out []*HistoricalCandidate
+	for rows.Next() {
+		c := &HistoricalCandidate{}
+		var resultJSON string
+		if err := rows.Scan(&c.AlertID, &c.Fingerprint, &c.AlertName, &c.Severity, &c.StartsAt,
+			&c.Labels, &c.Annotations, &resultJSON, &c.FinalStatus, &c.FeedbackSummary, &c.ResolvedVia); err != nil {
+			return nil, err
+		}
+		c.AnalysisSummary, c.RootCause, c.HealingSummary = extractAnalysisFields(resultJSON)
+		out = append(out, c)
+	}
+	return out, rows.Err()
 }

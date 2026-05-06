@@ -301,6 +301,84 @@ func statusIcon(status string) string {
 	}
 }
 
+// buildFeedbackCard renders a 👍 / 👎 / 💬 feedback card following plan
+// execution. Button values carry alert_id and approval_id so the callback
+// handler can write IncidentFeedback rows. Comment button opens a short
+// input dialog (Lark's input element) so users can type a free-text note.
+func buildFeedbackCard(c FeedbackCard) map[string]any {
+	color := "blue"
+	headline := "How did this plan land?"
+	switch c.OutcomeStatus {
+	case "success":
+		color = "green"
+		headline = "✅ Plan executed — did it actually fix the issue?"
+	case "failed":
+		color = "red"
+		headline = "❌ Plan execution failed — was the diagnosis right?"
+	case "manual_resolution":
+		color = "blue"
+		headline = "ℹ️ Issue resolved without auto-healing — was the analysis useful?"
+	}
+
+	intro := "Quick feedback helps Alert-Genie learn. Future similar alerts will reference this."
+	if c.Note != "" {
+		intro = c.Note + "\n\n" + intro
+	}
+
+	elements := []map[string]any{
+		markdownElement(fmt.Sprintf("**Alert:** %s", c.AlertName)),
+		markdownElement(intro),
+		divider(),
+		{
+			"tag": "action",
+			"actions": []map[string]any{
+				{
+					"tag":  "button",
+					"text": map[string]any{"tag": "plain_text", "content": "👍 Worked"},
+					"type": "primary",
+					"value": map[string]string{
+						"action":      "feedback_thumbs_up",
+						"alert_id":    c.AlertID,
+						"approval_id": c.ApprovalID,
+					},
+				},
+				{
+					"tag":  "button",
+					"text": map[string]any{"tag": "plain_text", "content": "👎 Didn't work"},
+					"type": "danger",
+					"value": map[string]string{
+						"action":      "feedback_thumbs_down",
+						"alert_id":    c.AlertID,
+						"approval_id": c.ApprovalID,
+					},
+				},
+				{
+					"tag":  "button",
+					"text": map[string]any{"tag": "plain_text", "content": "💬 Comment"},
+					"type": "default",
+					"value": map[string]string{
+						"action":      "feedback_comment",
+						"alert_id":    c.AlertID,
+						"approval_id": c.ApprovalID,
+					},
+				},
+			},
+		},
+	}
+
+	return map[string]any{
+		"config": map[string]any{"wide_screen_mode": true},
+		"header": map[string]any{
+			"title": map[string]any{
+				"tag":     "plain_text",
+				"content": headline,
+			},
+			"template": color,
+		},
+		"elements": elements,
+	}
+}
+
 // markdownElement creates a Lark card markdown element.
 func markdownElement(content string) map[string]any {
 	return map[string]any{

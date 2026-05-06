@@ -14,6 +14,7 @@ import (
 	"github.com/alert-genie/alert-genie/internal/approval"
 	"github.com/alert-genie/alert-genie/internal/config"
 	"github.com/alert-genie/alert-genie/internal/executor"
+	"github.com/alert-genie/alert-genie/internal/incidents"
 	"github.com/alert-genie/alert-genie/internal/metrics"
 	"github.com/alert-genie/alert-genie/internal/notifier"
 	"github.com/alert-genie/alert-genie/internal/safety"
@@ -23,19 +24,21 @@ import (
 
 // Pipeline orchestrates the alert-to-action flow.
 type Pipeline struct {
-	cfg      *config.Config
-	fetcher  metrics.Fetcher
-	analyzer analyzer.Analyzer
-	safety   safety.Validator
-	approval approval.Manager
-	router   *executor.Router
-	notifier notifier.Notifier
-	store    store.Store
-	topology topology.Provider
-	logger   *slog.Logger
+	cfg       *config.Config
+	fetcher   metrics.Fetcher
+	analyzer  analyzer.Analyzer
+	safety    safety.Validator
+	approval  approval.Manager
+	router    *executor.Router
+	notifier  notifier.Notifier
+	store     store.Store
+	topology  topology.Provider
+	retriever incidents.Retriever
+	logger    *slog.Logger
 }
 
 // New creates a new Pipeline with all dependencies injected.
+// retriever may be nil — in that case historical context enrichment is skipped.
 func New(
 	cfg *config.Config,
 	fetcher metrics.Fetcher,
@@ -46,19 +49,21 @@ func New(
 	n notifier.Notifier,
 	st store.Store,
 	tp topology.Provider,
+	retriever incidents.Retriever,
 	logger *slog.Logger,
 ) *Pipeline {
 	return &Pipeline{
-		cfg:      cfg,
-		fetcher:  fetcher,
-		analyzer: az,
-		safety:   sv,
-		approval: am,
-		router:   router,
-		notifier: n,
-		store:    st,
-		topology: tp,
-		logger:   logger,
+		cfg:       cfg,
+		fetcher:   fetcher,
+		analyzer:  az,
+		safety:    sv,
+		approval:  am,
+		router:    router,
+		notifier:  n,
+		store:     st,
+		topology:  tp,
+		retriever: retriever,
+		logger:    logger,
 	}
 }
 
@@ -94,21 +99,26 @@ func (p *Pipeline) processOne(ctx context.Context, alertID string, a alert.Alert
 		topoCtx = convertTopology(topo)
 	}
 
+	// 3.5. Fetch historical incidents for additional context. This is
+	// best-effort — failures degrade gracefully to "no historical context".
+	historical := p.fetchHistorical(ctx, alertID, a)
+
 	req := analyzer.AnalysisRequest{
-		AlertName:    alertName,
-		AlertStatus:  a.Status,
-		Severity:     a.Severity(),
-		Labels:       a.Labels,
-		Annotations:  a.Annotations,
-		StartsAt:     a.StartsAt,
-		Duration:     time.Since(a.StartsAt),
-		GroupKey:     payload.GroupKey,
-		TotalInGroup: len(payload.Alerts),
-		CommonLabels: payload.CommonLabels,
-		GeneratorURL: a.GeneratorURL,
-		Metrics:      allMetrics,
-		Topology:     topoCtx,
-		Mode:         analyzer.Mode(p.cfg.Mode),
+		AlertName:           alertName,
+		AlertStatus:         a.Status,
+		Severity:            a.Severity(),
+		Labels:              a.Labels,
+		Annotations:         a.Annotations,
+		StartsAt:            a.StartsAt,
+		Duration:            time.Since(a.StartsAt),
+		GroupKey:            payload.GroupKey,
+		TotalInGroup:        len(payload.Alerts),
+		CommonLabels:        payload.CommonLabels,
+		GeneratorURL:        a.GeneratorURL,
+		Metrics:             allMetrics,
+		Topology:            topoCtx,
+		Mode:                analyzer.Mode(p.cfg.Mode),
+		HistoricalIncidents: historical,
 	}
 
 	// 4. Call LLM for analysis
@@ -254,6 +264,94 @@ func (p *Pipeline) HandleApprovalCallback(ctx context.Context, approvalID, actio
 	return nil
 }
 
+// HandleFeedbackCallback persists user feedback (👍 / 👎 / 💬) on a plan
+// and updates the alert outcome cache used by historical retrieval.
+//
+// The "feedback_comment" action only triggers a toast asking the user to
+// reply with text in the thread — the actual comment will arrive as a
+// chat event (see chat orchestrator) which writes a "comment_only"
+// IncidentFeedback row.
+func (p *Pipeline) HandleFeedbackCallback(ctx context.Context, alertID, approvalID, action, userID string) error {
+	rating := ""
+	switch action {
+	case "feedback_thumbs_up":
+		rating = "thumbs_up"
+	case "feedback_thumbs_down":
+		rating = "thumbs_down"
+	case "feedback_comment":
+		// We don't persist a row for "comment" — the actual comment text
+		// arrives later via chat events. Just acknowledge.
+		return nil
+	default:
+		return fmt.Errorf("unknown feedback action: %s", action)
+	}
+
+	id, err := generateUUID()
+	if err != nil {
+		return fmt.Errorf("generate feedback id: %w", err)
+	}
+	fb := &store.IncidentFeedback{
+		ID:         id,
+		AlertID:    alertID,
+		ApprovalID: approvalID,
+		Rating:     rating,
+		UserOpenID: userID,
+		CreatedAt:  time.Now(),
+	}
+	if err := p.store.SaveFeedback(ctx, fb); err != nil {
+		return fmt.Errorf("save feedback: %w", err)
+	}
+
+	// Refresh the alert_outcomes summary so the retriever sees this new vote.
+	p.refreshOutcome(ctx, alertID)
+
+	p.logger.Info("feedback recorded",
+		"alert_id", alertID, "approval_id", approvalID,
+		"rating", rating, "user", userID)
+	return nil
+}
+
+// refreshOutcome aggregates feedback + final approval status into
+// alert_outcomes for the given alert. Best-effort; failures are logged.
+func (p *Pipeline) refreshOutcome(ctx context.Context, alertID string) {
+	feedback, err := p.store.ListFeedback(ctx, alertID)
+	if err != nil {
+		p.logger.Warn("list feedback failed", "alert_id", alertID, "error", err)
+		return
+	}
+
+	up, down := 0, 0
+	for _, f := range feedback {
+		switch f.Rating {
+		case "thumbs_up":
+			up++
+		case "thumbs_down":
+			down++
+		}
+	}
+	feedbackSummary := fmt.Sprintf("thumbs_up=%d thumbs_down=%d", up, down)
+
+	// Pull the most recent approval for this alert to use as final status.
+	finalStatus := ""
+	approvals, _ := p.store.ListApprovals(ctx, store.ApprovalFilter{Limit: 50})
+	for _, ap := range approvals {
+		if ap.AlertID == alertID {
+			finalStatus = ap.Status
+			break // approvals are already ordered desc by requested_at
+		}
+	}
+
+	o := &store.AlertOutcome{
+		AlertID:             alertID,
+		FinalApprovalStatus: finalStatus,
+		FeedbackSummary:     feedbackSummary,
+		UpdatedAt:           time.Now(),
+	}
+	if err := p.store.UpsertOutcome(ctx, o); err != nil {
+		p.logger.Warn("upsert outcome failed", "alert_id", alertID, "error", err)
+	}
+}
+
 // StartExpireLoop starts a background goroutine that periodically expires stale approvals
 // and purges old processed_events idempotency records.
 func (p *Pipeline) StartExpireLoop(ctx context.Context) {
@@ -286,6 +384,50 @@ func (p *Pipeline) StartExpireLoop(ctx context.Context) {
 }
 
 // fetchMetrics queries Prometheus for metrics related to the alert.
+// fetchHistorical retrieves and converts historical incidents for the alert.
+// Best-effort: returns nil on any error so the analyzer call still proceeds.
+func (p *Pipeline) fetchHistorical(ctx context.Context, alertID string, a alert.Alert) []analyzer.HistoricalIncident {
+	if p.retriever == nil {
+		return nil
+	}
+	current := incidents.CurrentAlert{
+		AlertID:     alertID,
+		AlertName:   a.AlertName(),
+		Severity:    a.Severity(),
+		Labels:      a.Labels,
+		Annotations: a.Annotations,
+	}
+	hist, err := p.retriever.Retrieve(ctx, current)
+	if err != nil {
+		p.logger.Warn("historical retrieval failed, continuing without it",
+			"alertname", a.AlertName(), "error", err)
+		return nil
+	}
+	if len(hist) == 0 {
+		return nil
+	}
+	out := make([]analyzer.HistoricalIncident, 0, len(hist))
+	for _, h := range hist {
+		out = append(out, analyzer.HistoricalIncident{
+			AlertID:         h.AlertID,
+			AlertName:       h.AlertName,
+			Severity:        h.Severity,
+			StartedAt:       h.StartedAt,
+			Labels:          h.Labels,
+			AnalysisSummary: h.AnalysisSummary,
+			RootCause:       h.RootCause,
+			HealingSummary:  h.HealingSummary,
+			FinalStatus:     h.FinalStatus,
+			FeedbackSummary: h.FeedbackSummary,
+			ResolvedVia:     h.ResolvedVia,
+			RelevanceReason: h.RelevanceReason,
+		})
+	}
+	p.logger.Info("historical incidents retrieved",
+		"alertname", a.AlertName(), "count", len(out))
+	return out
+}
+
 func (p *Pipeline) fetchMetrics(ctx context.Context, a alert.Alert) []metrics.MetricSeries {
 	alertName := a.AlertName()
 	queries, ok := p.cfg.Prometheus.AlertQueries[alertName]

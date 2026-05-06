@@ -17,9 +17,39 @@ import (
 // Chat extends the analyzer with multi-turn conversation support: given the
 // original analysis, prior conversation history, and a new user message, it
 // returns either a plain text reply or a revised healing plan.
+//
+// RankIncidents is a lightweight relevance-ranking call used by the historical
+// retriever. It scores past incidents against a current alert and returns
+// the top K, with reasons. Implemented as a separate small prompt to keep
+// per-alert cost bounded.
 type Analyzer interface {
 	Analyze(ctx context.Context, req AnalysisRequest) (*AnalysisResult, error)
 	Chat(ctx context.Context, req ChatRequest) (*ChatResponse, error)
+	RankIncidents(ctx context.Context, req RankRequest) (*RankResponse, error)
+}
+
+// RankRequest carries everything needed for the ranker call.
+type RankRequest struct {
+	// CurrentAlert is the new alert needing context.
+	CurrentAlertJSON string
+	// CandidatesJSON is a JSON array of candidate incidents (compact form).
+	CandidatesJSON string
+	// TopK is how many incidents to return.
+	TopK int
+}
+
+// RankResponse is the ranker's structured output.
+type RankResponse struct {
+	Ranked     []RankedItem `json:"ranked"`
+	ModelUsed  string       `json:"model_used"`
+	TokensUsed TokenUsage   `json:"tokens_used"`
+}
+
+// RankedItem is a single ranked incident reference.
+type RankedItem struct {
+	AlertID         string  `json:"alert_id"`
+	RelevanceScore  float64 `json:"relevance_score"`  // 0.0-1.0
+	RelevanceReason string  `json:"relevance_reason"` // 1-2 sentence
 }
 
 // claudeAnalyzer implements Analyzer using the Anthropic Messages API.
@@ -251,6 +281,72 @@ func (ca *claudeAnalyzer) Chat(ctx context.Context, req ChatRequest) (*ChatRespo
 	}
 
 	return chatResp, nil
+}
+
+// RankIncidents asks Claude to score historical incident relevance to the
+// current alert. The prompt is intentionally tiny and constrained to JSON
+// output to keep cost bounded.
+func (ca *claudeAnalyzer) RankIncidents(ctx context.Context, req RankRequest) (*RankResponse, error) {
+	if req.TopK <= 0 {
+		req.TopK = 3
+	}
+
+	systemPrompt := fmt.Sprintf(`You are an SRE assistant that ranks historical incidents by relevance to a new alert. You will receive:
+
+- The CURRENT alert (subject of the new analysis).
+- A JSON array of CANDIDATE past incidents.
+
+Your job: pick the %d candidates MOST relevant to the current alert. Relevance is highest when:
+
+1. Same alertname OR clearly the same kind of issue (e.g. "high memory" vs "OOM").
+2. Same affected service / component (look at labels: service, job, namespace, instance).
+3. The candidate's resolution would plausibly apply to the current alert.
+
+Penalize candidates that are clearly different problems even if alertname matches (e.g. memory pressure on a different unrelated service).
+
+OUTPUT: a single JSON object, no markdown, no prose. Schema:
+
+{
+  "ranked": [
+    {
+      "alert_id": "<exact alert_id from candidates>",
+      "relevance_score": 0.0-1.0,
+      "relevance_reason": "<one sentence explaining why this is relevant>"
+    }
+  ]
+}
+
+Only include candidates with relevance_score >= 0.4. If nothing is relevant, return {"ranked": []}.
+
+CRITICAL: alert_id must be copied EXACTLY from the candidate list. Never fabricate IDs. Order results by relevance_score descending.`, req.TopK)
+
+	userMessage := fmt.Sprintf("CURRENT ALERT:\n%s\n\nCANDIDATES (JSON array):\n%s",
+		req.CurrentAlertJSON, req.CandidatesJSON)
+
+	resp, err := ca.callAPI(ctx, systemPrompt, []claudeMessage{
+		{Role: "user", Content: userMessage},
+	})
+	if err != nil {
+		return nil, fmt.Errorf("rank API call: %w", err)
+	}
+
+	text := extractText(resp)
+	cleaned := stripCodeFences(text)
+	if extracted := extractFirstJSONObject(cleaned); extracted != "" {
+		cleaned = extracted
+	}
+
+	var rr RankResponse
+	if err := json.Unmarshal([]byte(cleaned), &rr); err != nil {
+		return nil, fmt.Errorf("parse rank JSON: %w (raw: %.200s)", err, text)
+	}
+
+	rr.ModelUsed = resp.Model
+	rr.TokensUsed = TokenUsage{
+		InputTokens:  resp.Usage.InputTokens,
+		OutputTokens: resp.Usage.OutputTokens,
+	}
+	return &rr, nil
 }
 
 func (ca *claudeAnalyzer) callAPI(ctx context.Context, systemPrompt string, messages []claudeMessage) (*claudeResponse, error) {

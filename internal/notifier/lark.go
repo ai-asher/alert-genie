@@ -360,3 +360,8 @@ func (l *LarkNotifier) SendReply(ctx context.Context, parentMessageID, text stri
 
 	return result.Data.MessageID, nil
 }
+
+// SendFeedbackCard sends a 👍 / 👎 / 💬 feedback card to the configured alert chat.
+func (l *LarkNotifier) SendFeedbackCard(ctx context.Context, card FeedbackCard) (string, error) {
+	return l.sendCard(ctx, l.alertChatID, buildFeedbackCard(card))
+}

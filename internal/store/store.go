@@ -2,8 +2,13 @@ package store
 
 import (
 	"context"
+	"encoding/json"
 	"time"
 )
+
+// jsonUnmarshal is a thin wrapper to keep the helper file independent of
+// direct encoding/json imports elsewhere in this package.
+var jsonUnmarshal = json.Unmarshal
 
 type AlertRecord struct {
 	ID          string     `db:"id"`
@@ -103,6 +108,47 @@ type Message struct {
 	CreatedAt       time.Time `db:"created_at"`
 }
 
+// IncidentFeedback captures user feedback on a healing plan / analysis.
+type IncidentFeedback struct {
+	ID            string    `db:"id"`
+	AlertID       string    `db:"alert_id"`
+	ApprovalID    string    `db:"approval_id"`
+	Rating        string    `db:"rating"` // "thumbs_up", "thumbs_down", "comment_only"
+	Comment       string    `db:"comment"`
+	UserOpenID    string    `db:"user_open_id"`
+	UserName      string    `db:"user_name"`
+	LarkMessageID string    `db:"lark_message_id"`
+	CreatedAt     time.Time `db:"created_at"`
+}
+
+// AlertOutcome is a per-alert summary used by historical retrieval.
+type AlertOutcome struct {
+	AlertID             string    `db:"alert_id"`
+	FinalApprovalStatus string    `db:"final_approval_status"`
+	FeedbackSummary     string    `db:"feedback_summary"`
+	ResolvedVia         string    `db:"resolved_via"`
+	UpdatedAt           time.Time `db:"updated_at"`
+}
+
+// HistoricalCandidate is a lean read-side view used by the incident retriever.
+// It joins alerts + analyses + alert_outcomes to give the LLM enough context
+// to score relevance without re-fetching JSON blobs.
+type HistoricalCandidate struct {
+	AlertID         string
+	Fingerprint     string
+	AlertName       string
+	Severity        string
+	StartsAt        time.Time
+	Labels          string // JSON
+	Annotations     string // JSON
+	AnalysisSummary string // truncated AnalysisResult.Summary
+	RootCause       string // truncated AnalysisResult.RootCause
+	HealingSummary  string // short description of healing plan if any
+	FinalStatus     string // from alert_outcomes.final_approval_status
+	FeedbackSummary string // from alert_outcomes.feedback_summary
+	ResolvedVia     string // from alert_outcomes.resolved_via
+}
+
 // Store is the persistence interface. Implementations must be safe for concurrent use.
 type Store interface {
 	// Alert records
@@ -142,7 +188,63 @@ type Store interface {
 	MarkEventProcessed(ctx context.Context, eventID string) (firstTime bool, err error)
 	PurgeOldEvents(ctx context.Context, olderThan time.Time) (int, error)
 
+	// Incident feedback (closed-loop learning)
+	SaveFeedback(ctx context.Context, fb *IncidentFeedback) error
+	ListFeedback(ctx context.Context, alertID string) ([]*IncidentFeedback, error)
+	UpsertOutcome(ctx context.Context, o *AlertOutcome) error
+	GetOutcome(ctx context.Context, alertID string) (*AlertOutcome, error)
+
+	// Historical retrieval candidates. Returns a join of alerts + analyses +
+	// alert_outcomes filtered by alertname or label keys, ordered by
+	// recency. Used as the candidate pool for Claude-based semantic ranking.
+	FindHistoricalCandidates(ctx context.Context, query HistoricalQuery) ([]*HistoricalCandidate, error)
+
 	// Lifecycle
 	Migrate(ctx context.Context) error
 	Close() error
+}
+
+// HistoricalQuery describes filters for the candidate retrieval.
+type HistoricalQuery struct {
+	AlertName      string            // exact match by alertname when non-empty
+	Labels         map[string]string // labels to match in JSON labels column
+	ExcludeAlertID string            // skip this alert (typically the current one)
+	Limit          int               // default 50 if zero
+	Since          *time.Time        // only candidates received after this point
+}
+
+// extractAnalysisFields pulls a few short summary fields out of a serialized
+// AnalysisResult JSON without depending on the analyzer package (avoiding
+// import cycle). Returns ("", "", "") on parse failure.
+func extractAnalysisFields(resultJSON string) (summary, rootCause, healingSummary string) {
+	if resultJSON == "" {
+		return "", "", ""
+	}
+	var partial struct {
+		Summary     string `json:"summary"`
+		RootCause   string `json:"root_cause"`
+		HealingPlan *struct {
+			Description string `json:"description"`
+			OverallRisk string `json:"overall_risk"`
+		} `json:"healing_plan"`
+	}
+	if err := jsonUnmarshal([]byte(resultJSON), &partial); err != nil {
+		return "", "", ""
+	}
+	summary = truncate(partial.Summary, 240)
+	rootCause = truncate(partial.RootCause, 240)
+	if partial.HealingPlan != nil {
+		healingSummary = truncate(partial.HealingPlan.Description, 240)
+		if partial.HealingPlan.OverallRisk != "" {
+			healingSummary += " (risk=" + partial.HealingPlan.OverallRisk + ")"
+		}
+	}
+	return summary, rootCause, healingSummary
+}
+
+func truncate(s string, n int) string {
+	if len(s) <= n {
+		return s
+	}
+	return s[:n] + "..."
 }

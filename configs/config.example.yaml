@@ -96,6 +96,17 @@ store:
 topology:
   config_path: "./configs/topology.example.yaml"
 
+# Historical incident retrieval. When enabled, the analyzer is fed the most
+# relevant past incidents for each new alert (selected via SQL pre-filter +
+# Claude-based semantic ranking). User feedback (👍/👎) on past plans
+# influences which incidents the LLM emphasizes.
+historical:
+  enabled: true
+  candidate_pool_size: 50    # SQL pre-filter cap
+  top_k: 3                   # incidents fed to main analyzer
+  lookback_days: 90
+  min_candidates_for_llm: 2  # skip the ranker if fewer candidates than this
+
 logging:
   level: "info"
   format: "json"

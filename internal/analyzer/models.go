@@ -32,6 +32,30 @@ type AnalysisRequest struct {
 	Metrics      []metrics.MetricSeries
 	Topology     *TopologyContext
 	Mode         Mode
+
+	// HistoricalIncidents provides past similar alerts and how they were
+	// resolved. Optional — when empty the prompt simply omits the section.
+	// Each incident is a compact summary; full details live in the store.
+	HistoricalIncidents []HistoricalIncident
+}
+
+// HistoricalIncident is a compact past-incident reference fed to the analyzer.
+// It mirrors incidents.HistoricalIncident but lives here to avoid a direct
+// dependency from analyzer onto incidents (the data flows in one direction:
+// pipeline -> retriever -> analyzer).
+type HistoricalIncident struct {
+	AlertID         string
+	AlertName       string
+	Severity        string
+	StartedAt       time.Time
+	Labels          string // JSON
+	AnalysisSummary string
+	RootCause       string
+	HealingSummary  string
+	FinalStatus     string
+	FeedbackSummary string
+	ResolvedVia     string
+	RelevanceReason string
 }
 
 // TopologyContext holds service topology info for the prompt.

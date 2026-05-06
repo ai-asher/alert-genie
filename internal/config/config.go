@@ -24,6 +24,7 @@ type Config struct {
 	Approval     ApprovalConfig     `yaml:"approval"`
 	Store        StoreConfig        `yaml:"store"`
 	Topology     TopologyConfig     `yaml:"topology"`
+	Historical   HistoricalConfig   `yaml:"historical"`
 	Logging      LoggingConfig      `yaml:"logging"`
 }
 
@@ -145,6 +146,15 @@ type StoreConfig struct {
 
 type TopologyConfig struct {
 	ConfigPath string `yaml:"config_path"`
+}
+
+// HistoricalConfig controls the historical incident retriever.
+type HistoricalConfig struct {
+	Enabled             bool `yaml:"enabled"`                // master switch, default false
+	CandidatePoolSize   int  `yaml:"candidate_pool_size"`    // SQL pre-filter cap, default 50
+	TopK                int  `yaml:"top_k"`                  // # incidents fed into main prompt, default 3
+	LookbackDays        int  `yaml:"lookback_days"`          // freshness window, default 90
+	MinCandidatesForLLM int  `yaml:"min_candidates_for_llm"` // skip ranker below this, default 2
 }
 
 type LoggingConfig struct {
@@ -274,5 +284,18 @@ func setDefaults(cfg *Config) {
 	}
 	if cfg.Logging.Format == "" {
 		cfg.Logging.Format = "json"
+	}
+	// Historical retriever defaults (only applied when enabled)
+	if cfg.Historical.CandidatePoolSize == 0 {
+		cfg.Historical.CandidatePoolSize = 50
+	}
+	if cfg.Historical.TopK == 0 {
+		cfg.Historical.TopK = 3
+	}
+	if cfg.Historical.LookbackDays == 0 {
+		cfg.Historical.LookbackDays = 90
+	}
+	if cfg.Historical.MinCandidatesForLLM == 0 {
+		cfg.Historical.MinCandidatesForLLM = 2
 	}
 }

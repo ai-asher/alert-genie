@@ -6,20 +6,38 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"strings"
 )
 
-// CallbackHandler handles Lark card button callbacks.
+// ApprovalCallback is invoked for approve/reject/modify button presses on
+// healing plan cards.
+type ApprovalCallback func(ctx context.Context, approvalID, action, userID string) error
+
+// FeedbackCallback is invoked for the feedback card buttons (👍/👎/💬).
+// The values map carries alert_id and approval_id (approval_id may be empty
+// when feedback is solicited without a healing execution).
+type FeedbackCallback func(ctx context.Context, alertID, approvalID, action, userID string) error
+
+// CallbackHandler handles Lark card button callbacks. Single endpoint, dispatches
+// by action prefix: "feedback_*" → FeedbackProcessFunc, others → ApprovalProcessFunc.
 type CallbackHandler struct {
-	verificationToken string
-	ProcessFunc       func(ctx context.Context, approvalID, action, userID string) error
+	verificationToken   string
+	ApprovalProcessFunc ApprovalCallback
+	FeedbackProcessFunc FeedbackCallback
 }
 
 // NewCallbackHandler creates a new CallbackHandler.
-func NewCallbackHandler(verificationToken string, processFunc func(ctx context.Context, approvalID, action, userID string) error) *CallbackHandler {
+// feedbackProcessFunc may be nil if feedback collection is disabled.
+func NewCallbackHandler(verificationToken string, approvalProcessFunc ApprovalCallback) *CallbackHandler {
 	return &CallbackHandler{
-		verificationToken: verificationToken,
-		ProcessFunc:       processFunc,
+		verificationToken:   verificationToken,
+		ApprovalProcessFunc: approvalProcessFunc,
 	}
+}
+
+// SetFeedbackHandler attaches the feedback callback. Optional.
+func (h *CallbackHandler) SetFeedbackHandler(fn FeedbackCallback) {
+	h.FeedbackProcessFunc = fn
 }
 
 // callbackRequest represents the JSON body from a Lark card action callback.
@@ -66,29 +84,36 @@ func (h *CallbackHandler) HandleCallback(w http.ResponseWriter, r *http.Request)
 	}
 
 	action := req.Action.Value["action"]
+	if action == "" {
+		http.Error(w, "missing action", http.StatusBadRequest)
+		return
+	}
+
+	// Dispatch by action prefix
+	if strings.HasPrefix(action, "feedback_") {
+		h.handleFeedback(w, r, req, action)
+		return
+	}
+	h.handleApproval(w, r, req, action)
+}
+
+func (h *CallbackHandler) handleApproval(w http.ResponseWriter, r *http.Request, req callbackRequest, action string) {
 	approvalID := req.Action.Value["approval_id"]
-
-	if action == "" || approvalID == "" {
-		http.Error(w, "missing action or approval_id", http.StatusBadRequest)
+	if approvalID == "" {
+		http.Error(w, "missing approval_id", http.StatusBadRequest)
 		return
 	}
 
-	// Process the callback
-	if err := h.ProcessFunc(r.Context(), approvalID, action, req.OpenID); err != nil {
-		// Return a toast with error
-		w.Header().Set("Content-Type", "application/json")
-		resp, _ := json.Marshal(map[string]any{
-			"toast": map[string]any{
-				"type":    "error",
-				"content": fmt.Sprintf("Failed to process: %v", err),
-			},
-		})
-		w.Write(resp)
+	if h.ApprovalProcessFunc == nil {
+		respondToast(w, "warning", "Approvals are not configured")
 		return
 	}
 
-	// Return a success toast
-	w.Header().Set("Content-Type", "application/json")
+	if err := h.ApprovalProcessFunc(r.Context(), approvalID, action, req.OpenID); err != nil {
+		respondToast(w, "error", fmt.Sprintf("Failed to process: %v", err))
+		return
+	}
+
 	toastContent := "Action processed successfully"
 	switch action {
 	case "approve":
@@ -98,10 +123,45 @@ func (h *CallbackHandler) HandleCallback(w http.ResponseWriter, r *http.Request)
 	case "modify":
 		toastContent = "Plan approved with modifications."
 	}
+	respondToast(w, "success", toastContent)
+}
+
+func (h *CallbackHandler) handleFeedback(w http.ResponseWriter, r *http.Request, req callbackRequest, action string) {
+	alertID := req.Action.Value["alert_id"]
+	approvalID := req.Action.Value["approval_id"] // may be empty
+	if alertID == "" {
+		http.Error(w, "missing alert_id for feedback", http.StatusBadRequest)
+		return
+	}
+
+	if h.FeedbackProcessFunc == nil {
+		respondToast(w, "warning", "Feedback collection is not enabled")
+		return
+	}
+
+	if err := h.FeedbackProcessFunc(r.Context(), alertID, approvalID, action, req.OpenID); err != nil {
+		respondToast(w, "error", fmt.Sprintf("Failed to record feedback: %v", err))
+		return
+	}
+
+	toastContent := "Thanks for the feedback!"
+	switch action {
+	case "feedback_thumbs_up":
+		toastContent = "👍 Logged. This will boost similar past plans for future alerts."
+	case "feedback_thumbs_down":
+		toastContent = "👎 Logged. We'll avoid this approach for similar future alerts."
+	case "feedback_comment":
+		toastContent = "💬 Reply in this thread to leave a comment — Alert-Genie will pick it up."
+	}
+	respondToast(w, "success", toastContent)
+}
+
+func respondToast(w http.ResponseWriter, typ, content string) {
+	w.Header().Set("Content-Type", "application/json")
 	resp, _ := json.Marshal(map[string]any{
 		"toast": map[string]any{
-			"type":    "success",
-			"content": toastContent,
+			"type":    typ,
+			"content": content,
 		},
 	})
 	w.Write(resp)

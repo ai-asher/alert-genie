@@ -16,6 +16,7 @@ import (
 	"github.com/alert-genie/alert-genie/internal/chat"
 	"github.com/alert-genie/alert-genie/internal/config"
 	"github.com/alert-genie/alert-genie/internal/executor"
+	"github.com/alert-genie/alert-genie/internal/incidents"
 	"github.com/alert-genie/alert-genie/internal/metrics"
 	"github.com/alert-genie/alert-genie/internal/notifier"
 	"github.com/alert-genie/alert-genie/internal/pipeline"
@@ -121,7 +122,8 @@ func main() {
 	router := executor.NewRouter(executors, st, larkNotifier, logger)
 
 	// Initialize pipeline
-	pipe := pipeline.New(cfg, fetcher, az, sv, am, router, larkNotifier, st, topo, logger)
+	pipe := pipeline.New(cfg, fetcher, az, sv, am, router, larkNotifier, st, topo,
+		buildRetriever(st, az, cfg, logger), logger)
 
 	// Initialize alert handler
 	dedup := alert.NewDeduplicator(cfg.Alertmanager.DedupWindow)
@@ -135,6 +137,7 @@ func main() {
 		cfg.Lark.VerificationToken,
 		pipe.HandleApprovalCallback,
 	)
+	callbackHandler.SetFeedbackHandler(pipe.HandleFeedbackCallback)
 
 	// Initialize chat orchestrator (multi-turn conversations triggered by @Bot)
 	chatOrchestrator := chat.New(st, az, larkNotifier, am, sv, cfg.Approval.TTL, logger)
@@ -193,6 +196,28 @@ func main() {
 		logger.Error("server shutdown error", "error", err)
 	}
 	logger.Info("alert-genie stopped")
+}
+
+// buildRetriever constructs the historical incident retriever, returning nil
+// when disabled in config so the pipeline can skip that pass cleanly.
+func buildRetriever(st store.Store, az analyzer.Analyzer, cfg *config.Config, logger *slog.Logger) incidents.Retriever {
+	if !cfg.Historical.Enabled {
+		logger.Info("historical incident retriever disabled (set historical.enabled: true to enable)")
+		return nil
+	}
+	logger.Info("historical incident retriever enabled",
+		"candidate_pool_size", cfg.Historical.CandidatePoolSize,
+		"top_k", cfg.Historical.TopK,
+		"lookback_days", cfg.Historical.LookbackDays,
+	)
+	ranker := &incidents.AnalyzerRanker{A: az}
+	return incidents.New(st, ranker, incidents.Config{
+		CandidatePoolSize:   cfg.Historical.CandidatePoolSize,
+		TopK:                cfg.Historical.TopK,
+		LookbackDays:        cfg.Historical.LookbackDays,
+		MinCandidatesForLLM: cfg.Historical.MinCandidatesForLLM,
+		Enabled:             true,
+	}, logger)
 }
 
 func setupLogger(cfg config.LoggingConfig) *slog.Logger {

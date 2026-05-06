@@ -146,8 +146,28 @@ func (r *Router) ExecutePlan(ctx context.Context, approval *store.ApprovalRecord
 	// All steps succeeded
 	r.store.UpdateApprovalStatus(ctx, approval.ID, "completed", "system", "all steps executed successfully")
 	r.notifier.SendExecutionComplete(ctx, approval.LarkMessageID, true, "All healing steps completed successfully")
+	r.sendFeedbackPrompt(ctx, approval, "success", "Plan executed without errors.")
 
 	r.logger.Info("plan execution completed", "approval_id", approval.ID)
+}
+
+// sendFeedbackPrompt sends a 👍 / 👎 / 💬 card to the alert chat after plan
+// outcome is final. Best-effort — failures are logged, not surfaced.
+func (r *Router) sendFeedbackPrompt(ctx context.Context, approval *store.ApprovalRecord, outcome, note string) {
+	alertName := ""
+	if rec, _ := r.store.GetAlert(ctx, approval.AlertID); rec != nil {
+		alertName = rec.AlertName
+	}
+	_, err := r.notifier.SendFeedbackCard(ctx, notifier.FeedbackCard{
+		AlertID:       approval.AlertID,
+		ApprovalID:    approval.ID,
+		AlertName:     alertName,
+		OutcomeStatus: outcome,
+		Note:          note,
+	})
+	if err != nil {
+		r.logger.Warn("send feedback card failed", "approval_id", approval.ID, "error", err)
+	}
 }
 
 func (r *Router) recordStep(ctx context.Context, approval *store.ApprovalRecord, cmd HealingCommandJSON, status, output, errMsg string) {
@@ -184,6 +204,8 @@ func (r *Router) failPlan(ctx context.Context, approval *store.ApprovalRecord, s
 		fmt.Sprintf("failed at step %d", failedStep))
 	r.notifier.SendExecutionComplete(ctx, approval.LarkMessageID, false,
 		fmt.Sprintf("Execution failed at step %d. Review logs and consider rollback.", failedStep))
+	r.sendFeedbackPrompt(ctx, approval, "failed",
+		fmt.Sprintf("Execution failed at step %d. Was the diagnosis at least useful?", failedStep))
 
 	r.logger.Error("plan execution failed",
 		"approval_id", approval.ID,
