@@ -42,15 +42,41 @@ func NewSQLite(path string) (Store, error) {
 }
 
 func (s *sqliteStore) Migrate(ctx context.Context) error {
-	data, err := migrationsFS.ReadFile("migrations/001_init.sql")
-	if err != nil {
-		return fmt.Errorf("read migration: %w", err)
-	}
-	_, err = s.db.ExecContext(ctx, string(data))
-	if err != nil {
-		return fmt.Errorf("run migration: %w", err)
+	migrations := []string{"migrations/001_init.sql", "migrations/002_chat.sql"}
+	for _, m := range migrations {
+		data, err := migrationsFS.ReadFile(m)
+		if err != nil {
+			return fmt.Errorf("read migration %s: %w", m, err)
+		}
+		if _, err := s.db.ExecContext(ctx, string(data)); err != nil {
+			// SQLite ALTER TABLE will fail on re-run if column exists; tolerate it
+			if !isAlreadyExistsErr(err) {
+				return fmt.Errorf("run migration %s: %w", m, err)
+			}
+		}
 	}
 	return nil
+}
+
+func isAlreadyExistsErr(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := err.Error()
+	return contains(msg, "duplicate column") || contains(msg, "already exists")
+}
+
+func contains(s, sub string) bool {
+	return len(s) >= len(sub) && (s == sub || indexOf(s, sub) >= 0)
+}
+
+func indexOf(s, sub string) int {
+	for i := 0; i+len(sub) <= len(s); i++ {
+		if s[i:i+len(sub)] == sub {
+			return i
+		}
+	}
+	return -1
 }
 
 func (s *sqliteStore) Close() error {
@@ -163,20 +189,20 @@ func (s *sqliteStore) GetAnalysis(ctx context.Context, alertID string) (*Analysi
 
 func (s *sqliteStore) SaveApproval(ctx context.Context, a *ApprovalRecord) error {
 	_, err := s.db.ExecContext(ctx,
-		`INSERT INTO approvals (id, alert_id, plan_json, status, requested_at, lark_message_id, expires_at)
-		 VALUES (?, ?, ?, ?, ?, ?, ?)`,
-		a.ID, a.AlertID, a.PlanJSON, a.Status, a.RequestedAt, a.LarkMessageID, a.ExpiresAt,
+		`INSERT INTO approvals (id, alert_id, plan_json, status, requested_at, lark_message_id, expires_at, parent_approval_id)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+		a.ID, a.AlertID, a.PlanJSON, a.Status, a.RequestedAt, a.LarkMessageID, a.ExpiresAt, a.ParentApprovalID,
 	)
 	return err
 }
 
 func (s *sqliteStore) GetApproval(ctx context.Context, id string) (*ApprovalRecord, error) {
 	row := s.db.QueryRowContext(ctx,
-		`SELECT id, alert_id, plan_json, status, requested_at, responded_at, approver_id, approver_name, comment, lark_message_id, expires_at
+		`SELECT id, alert_id, plan_json, status, requested_at, responded_at, approver_id, approver_name, comment, lark_message_id, expires_at, COALESCE(parent_approval_id, '')
 		 FROM approvals WHERE id = ?`, id)
 	a := &ApprovalRecord{}
 	err := row.Scan(&a.ID, &a.AlertID, &a.PlanJSON, &a.Status, &a.RequestedAt, &a.RespondedAt,
-		&a.ApproverID, &a.ApproverName, &a.Comment, &a.LarkMessageID, &a.ExpiresAt)
+		&a.ApproverID, &a.ApproverName, &a.Comment, &a.LarkMessageID, &a.ExpiresAt, &a.ParentApprovalID)
 	if err == sql.ErrNoRows {
 		return nil, nil
 	}
@@ -193,7 +219,7 @@ func (s *sqliteStore) UpdateApprovalStatus(ctx context.Context, id string, statu
 }
 
 func (s *sqliteStore) ListApprovals(ctx context.Context, filter ApprovalFilter) ([]*ApprovalRecord, error) {
-	query := `SELECT id, alert_id, plan_json, status, requested_at, responded_at, approver_id, approver_name, comment, lark_message_id, expires_at FROM approvals WHERE 1=1`
+	query := `SELECT id, alert_id, plan_json, status, requested_at, responded_at, approver_id, approver_name, comment, lark_message_id, expires_at, COALESCE(parent_approval_id, '') FROM approvals WHERE 1=1`
 	var args []any
 
 	if filter.Status != nil {
@@ -220,7 +246,7 @@ func (s *sqliteStore) ListApprovals(ctx context.Context, filter ApprovalFilter) 
 	for rows.Next() {
 		a := &ApprovalRecord{}
 		if err := rows.Scan(&a.ID, &a.AlertID, &a.PlanJSON, &a.Status, &a.RequestedAt, &a.RespondedAt,
-			&a.ApproverID, &a.ApproverName, &a.Comment, &a.LarkMessageID, &a.ExpiresAt); err != nil {
+			&a.ApproverID, &a.ApproverName, &a.Comment, &a.LarkMessageID, &a.ExpiresAt, &a.ParentApprovalID); err != nil {
 			return nil, err
 		}
 		approvals = append(approvals, a)
@@ -259,4 +285,105 @@ func (s *sqliteStore) ListExecutionLogs(ctx context.Context, approvalID string) 
 		logs = append(logs, l)
 	}
 	return logs, rows.Err()
+}
+
+// Conversations
+
+func (s *sqliteStore) SaveConversation(ctx context.Context, c *Conversation) error {
+	_, err := s.db.ExecContext(ctx,
+		`INSERT INTO conversations (id, alert_id, approval_id, lark_chat_id, root_message_id, created_at, updated_at)
+		 VALUES (?, ?, ?, ?, ?, ?, ?)`,
+		c.ID, c.AlertID, c.ApprovalID, c.LarkChatID, c.RootMessageID, c.CreatedAt, c.UpdatedAt,
+	)
+	return err
+}
+
+func (s *sqliteStore) GetConversation(ctx context.Context, id string) (*Conversation, error) {
+	row := s.db.QueryRowContext(ctx,
+		`SELECT id, alert_id, COALESCE(approval_id, ''), lark_chat_id, root_message_id, created_at, updated_at
+		 FROM conversations WHERE id = ?`, id)
+	c := &Conversation{}
+	err := row.Scan(&c.ID, &c.AlertID, &c.ApprovalID, &c.LarkChatID, &c.RootMessageID, &c.CreatedAt, &c.UpdatedAt)
+	if err == sql.ErrNoRows {
+		return nil, nil
+	}
+	return c, err
+}
+
+func (s *sqliteStore) GetConversationByRootMessage(ctx context.Context, rootMessageID string) (*Conversation, error) {
+	row := s.db.QueryRowContext(ctx,
+		`SELECT id, alert_id, COALESCE(approval_id, ''), lark_chat_id, root_message_id, created_at, updated_at
+		 FROM conversations WHERE root_message_id = ?`, rootMessageID)
+	c := &Conversation{}
+	err := row.Scan(&c.ID, &c.AlertID, &c.ApprovalID, &c.LarkChatID, &c.RootMessageID, &c.CreatedAt, &c.UpdatedAt)
+	if err == sql.ErrNoRows {
+		return nil, nil
+	}
+	return c, err
+}
+
+func (s *sqliteStore) GetConversationByAlert(ctx context.Context, alertID string) (*Conversation, error) {
+	row := s.db.QueryRowContext(ctx,
+		`SELECT id, alert_id, COALESCE(approval_id, ''), lark_chat_id, root_message_id, created_at, updated_at
+		 FROM conversations WHERE alert_id = ? ORDER BY created_at DESC LIMIT 1`, alertID)
+	c := &Conversation{}
+	err := row.Scan(&c.ID, &c.AlertID, &c.ApprovalID, &c.LarkChatID, &c.RootMessageID, &c.CreatedAt, &c.UpdatedAt)
+	if err == sql.ErrNoRows {
+		return nil, nil
+	}
+	return c, err
+}
+
+func (s *sqliteStore) UpdateConversationApproval(ctx context.Context, id, approvalID string) error {
+	_, err := s.db.ExecContext(ctx,
+		`UPDATE conversations SET approval_id = ?, updated_at = ? WHERE id = ?`,
+		approvalID, time.Now(), id,
+	)
+	return err
+}
+
+// Messages
+
+func (s *sqliteStore) SaveMessage(ctx context.Context, m *Message) error {
+	_, err := s.db.ExecContext(ctx,
+		`INSERT INTO messages (id, conversation_id, role, content, lark_message_id, parent_lark_msg_id, user_open_id, user_name, created_at)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		m.ID, m.ConversationID, m.Role, m.Content, m.LarkMessageID, m.ParentLarkMsgID, m.UserOpenID, m.UserName, m.CreatedAt,
+	)
+	return err
+}
+
+func (s *sqliteStore) GetMessageByLarkID(ctx context.Context, larkMessageID string) (*Message, error) {
+	row := s.db.QueryRowContext(ctx,
+		`SELECT id, conversation_id, role, content, COALESCE(lark_message_id, ''), COALESCE(parent_lark_msg_id, ''), COALESCE(user_open_id, ''), COALESCE(user_name, ''), created_at
+		 FROM messages WHERE lark_message_id = ?`, larkMessageID)
+	m := &Message{}
+	err := row.Scan(&m.ID, &m.ConversationID, &m.Role, &m.Content, &m.LarkMessageID, &m.ParentLarkMsgID, &m.UserOpenID, &m.UserName, &m.CreatedAt)
+	if err == sql.ErrNoRows {
+		return nil, nil
+	}
+	return m, err
+}
+
+func (s *sqliteStore) ListMessages(ctx context.Context, conversationID string, limit int) ([]*Message, error) {
+	if limit <= 0 {
+		limit = 50
+	}
+	rows, err := s.db.QueryContext(ctx,
+		`SELECT id, conversation_id, role, content, COALESCE(lark_message_id, ''), COALESCE(parent_lark_msg_id, ''), COALESCE(user_open_id, ''), COALESCE(user_name, ''), created_at
+		 FROM messages WHERE conversation_id = ? ORDER BY created_at ASC LIMIT ?`, conversationID, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var msgs []*Message
+	for rows.Next() {
+		m := &Message{}
+		if err := rows.Scan(&m.ID, &m.ConversationID, &m.Role, &m.Content, &m.LarkMessageID, &m.ParentLarkMsgID, &m.UserOpenID, &m.UserName, &m.CreatedAt); err != nil {
+			return nil, err
+		}
+		msgs = append(msgs, m)
+	}
+	return msgs, rows.Err()
 }

@@ -13,6 +13,7 @@ import (
 	"github.com/alert-genie/alert-genie/internal/alert"
 	"github.com/alert-genie/alert-genie/internal/analyzer"
 	"github.com/alert-genie/alert-genie/internal/approval"
+	"github.com/alert-genie/alert-genie/internal/chat"
 	"github.com/alert-genie/alert-genie/internal/config"
 	"github.com/alert-genie/alert-genie/internal/executor"
 	"github.com/alert-genie/alert-genie/internal/metrics"
@@ -129,10 +130,21 @@ func main() {
 	alertHandler := alert.NewHandler(st, dedup, cfg.Alertmanager.SeverityFilter, logger)
 	alertHandler.ProcessFunc = pipe.ProcessAlert
 
-	// Initialize Lark callback handler
+	// Initialize Lark callback handler (card button clicks)
 	callbackHandler := notifier.NewCallbackHandler(
 		cfg.Lark.VerificationToken,
 		pipe.HandleApprovalCallback,
+	)
+
+	// Initialize chat orchestrator (multi-turn conversations triggered by @Bot)
+	chatOrchestrator := chat.New(st, az, larkNotifier, am, sv, cfg.Approval.TTL, logger)
+
+	// Initialize Lark event handler (group chat messages, @Bot mentions)
+	eventHandler := notifier.NewEventHandler(
+		cfg.Lark.VerificationToken,
+		cfg.Lark.BotOpenID,
+		cfg.Lark.BotName,
+		chatOrchestrator.HandleEvent,
 	)
 
 	// Initialize server
@@ -141,6 +153,7 @@ func main() {
 	// Register additional routes on the server's router
 	srv.Router().Post("/api/v1/alerts", alertHandler.HandleWebhook)
 	srv.Router().Post("/api/v1/lark/callback", callbackHandler.HandleCallback)
+	srv.Router().Post("/api/v1/lark/events", eventHandler.HandleEvent)
 
 	// Start background tasks
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)

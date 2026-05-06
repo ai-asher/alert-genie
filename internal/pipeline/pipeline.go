@@ -144,10 +144,13 @@ func (p *Pipeline) processOne(ctx context.Context, a alert.Alert, payload alert.
 
 	// 7. Branch: ReadOnly vs Healing
 	if p.cfg.Mode == "readonly" || result.HealingPlan == nil {
-		_, err := p.notifier.SendAnalysis(ctx, card)
+		msgID, err := p.notifier.SendAnalysis(ctx, card)
 		if err != nil {
 			p.logger.Error("failed to send analysis", "error", err)
+			return
 		}
+		// Create conversation so users can @Bot to ask follow-up questions
+		p.createConversation(ctx, a.Fingerprint, "", msgID)
 		return
 	}
 
@@ -198,11 +201,40 @@ func (p *Pipeline) processOne(ctx context.Context, a alert.Alert, payload alert.
 		p.logger.Error("failed to create approval", "error", err)
 	}
 
+	// 11. Create conversation so users can @Bot to ask follow-ups
+	p.createConversation(ctx, a.Fingerprint, approvalID, msgID)
+
 	p.logger.Info("healing plan sent for approval",
 		"alertname", alertName,
 		"approval_id", approvalID,
 		"commands", len(plan.Commands),
 	)
+}
+
+// createConversation creates a conversation record bound to the alert and rooted at
+// the message ID of the original card. Failures are logged but not fatal.
+func (p *Pipeline) createConversation(ctx context.Context, alertID, approvalID, rootMessageID string) {
+	if rootMessageID == "" {
+		return
+	}
+	convID, err := generateUUID()
+	if err != nil {
+		p.logger.Warn("conversation id generation failed", "error", err)
+		return
+	}
+	now := time.Now()
+	conv := &store.Conversation{
+		ID:            convID,
+		AlertID:       alertID,
+		ApprovalID:    approvalID,
+		LarkChatID:    p.cfg.Lark.AlertChatID,
+		RootMessageID: rootMessageID,
+		CreatedAt:     now,
+		UpdatedAt:     now,
+	}
+	if err := p.store.SaveConversation(ctx, conv); err != nil {
+		p.logger.Warn("save conversation failed", "error", err)
+	}
 }
 
 // HandleApprovalCallback processes an approval callback from Lark.

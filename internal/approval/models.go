@@ -6,19 +6,20 @@ import "time"
 type Status string
 
 const (
-	StatusPending   Status = "pending"
-	StatusApproved  Status = "approved"
-	StatusRejected  Status = "rejected"
-	StatusModified  Status = "modified"
-	StatusExpired   Status = "expired"
-	StatusExecuting Status = "executing"
-	StatusCompleted Status = "completed"
-	StatusFailed    Status = "failed"
+	StatusPending    Status = "pending"
+	StatusApproved   Status = "approved"
+	StatusRejected   Status = "rejected"
+	StatusModified   Status = "modified"
+	StatusExpired    Status = "expired"
+	StatusExecuting  Status = "executing"
+	StatusCompleted  Status = "completed"
+	StatusFailed     Status = "failed"
+	StatusSuperseded Status = "superseded"
 )
 
 // validTransitions defines the allowed state transitions.
 var validTransitions = map[Status][]Status{
-	StatusPending:   {StatusApproved, StatusRejected, StatusModified, StatusExpired},
+	StatusPending:   {StatusApproved, StatusRejected, StatusModified, StatusExpired, StatusSuperseded},
 	StatusApproved:  {StatusExecuting},
 	StatusModified:  {StatusExecuting},
 	StatusExecuting: {StatusCompleted, StatusFailed},
@@ -58,7 +59,7 @@ func StatusFromAction(action string) Status {
 // IsFinal returns true if the status represents a terminal state.
 func (s Status) IsFinal() bool {
 	switch s {
-	case StatusRejected, StatusExpired, StatusCompleted, StatusFailed:
+	case StatusRejected, StatusExpired, StatusCompleted, StatusFailed, StatusSuperseded:
 		return true
 	default:
 		return false

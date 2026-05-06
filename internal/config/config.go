@@ -66,6 +66,8 @@ type LarkConfig struct {
 	EncryptionKey     string `yaml:"encryption_key"`
 	AlertChatID       string `yaml:"alert_chat_id"`
 	CallbackURL       string `yaml:"callback_url"`
+	BotOpenID         string `yaml:"bot_open_id"` // optional, used to detect self-messages and bot @mentions
+	BotName           string `yaml:"bot_name"`    // fallback for detecting bot @mentions when BotOpenID is empty
 }
 
 type KubernetesConfig struct {

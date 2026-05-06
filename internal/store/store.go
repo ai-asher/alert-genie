@@ -33,17 +33,18 @@ type AnalysisRecord struct {
 }
 
 type ApprovalRecord struct {
-	ID            string     `db:"id"`
-	AlertID       string     `db:"alert_id"`
-	PlanJSON      string     `db:"plan_json"`
-	Status        string     `db:"status"`
-	RequestedAt   time.Time  `db:"requested_at"`
-	RespondedAt   *time.Time `db:"responded_at"`
-	ApproverID    string     `db:"approver_id"`
-	ApproverName  string     `db:"approver_name"`
-	Comment       string     `db:"comment"`
-	LarkMessageID string     `db:"lark_message_id"`
-	ExpiresAt     time.Time  `db:"expires_at"`
+	ID               string     `db:"id"`
+	AlertID          string     `db:"alert_id"`
+	PlanJSON         string     `db:"plan_json"`
+	Status           string     `db:"status"`
+	RequestedAt      time.Time  `db:"requested_at"`
+	RespondedAt      *time.Time `db:"responded_at"`
+	ApproverID       string     `db:"approver_id"`
+	ApproverName     string     `db:"approver_name"`
+	Comment          string     `db:"comment"`
+	LarkMessageID    string     `db:"lark_message_id"`
+	ExpiresAt        time.Time  `db:"expires_at"`
+	ParentApprovalID string     `db:"parent_approval_id"`
 }
 
 type ExecutionLog struct {
@@ -78,6 +79,30 @@ type ApprovalFilter struct {
 	Offset int
 }
 
+// Conversation represents a chat thread bound to an alert.
+type Conversation struct {
+	ID            string    `db:"id"`
+	AlertID       string    `db:"alert_id"`
+	ApprovalID    string    `db:"approval_id"`
+	LarkChatID    string    `db:"lark_chat_id"`
+	RootMessageID string    `db:"root_message_id"`
+	CreatedAt     time.Time `db:"created_at"`
+	UpdatedAt     time.Time `db:"updated_at"`
+}
+
+// Message is a single turn in a conversation.
+type Message struct {
+	ID              string    `db:"id"`
+	ConversationID  string    `db:"conversation_id"`
+	Role            string    `db:"role"` // "user", "assistant", "system"
+	Content         string    `db:"content"`
+	LarkMessageID   string    `db:"lark_message_id"`
+	ParentLarkMsgID string    `db:"parent_lark_msg_id"`
+	UserOpenID      string    `db:"user_open_id"`
+	UserName        string    `db:"user_name"`
+	CreatedAt       time.Time `db:"created_at"`
+}
+
 // Store is the persistence interface. Implementations must be safe for concurrent use.
 type Store interface {
 	// Alert records
@@ -98,6 +123,18 @@ type Store interface {
 	// Execution logs
 	SaveExecutionLog(ctx context.Context, log *ExecutionLog) error
 	ListExecutionLogs(ctx context.Context, approvalID string) ([]*ExecutionLog, error)
+
+	// Conversations
+	SaveConversation(ctx context.Context, conv *Conversation) error
+	GetConversation(ctx context.Context, id string) (*Conversation, error)
+	GetConversationByRootMessage(ctx context.Context, rootMessageID string) (*Conversation, error)
+	GetConversationByAlert(ctx context.Context, alertID string) (*Conversation, error)
+	UpdateConversationApproval(ctx context.Context, id, approvalID string) error
+
+	// Messages
+	SaveMessage(ctx context.Context, msg *Message) error
+	GetMessageByLarkID(ctx context.Context, larkMessageID string) (*Message, error)
+	ListMessages(ctx context.Context, conversationID string, limit int) ([]*Message, error)
 
 	// Lifecycle
 	Migrate(ctx context.Context) error

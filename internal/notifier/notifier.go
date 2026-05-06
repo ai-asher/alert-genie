@@ -67,4 +67,10 @@ type Notifier interface {
 	SendHealingPlan(ctx context.Context, card HealingPlanCard) (messageID string, err error)
 	UpdateProgress(ctx context.Context, messageID string, progress ExecutionProgress) error
 	SendExecutionComplete(ctx context.Context, messageID string, success bool, summary string) error
+
+	// SendText sends a plain text message to a chat. Returns the message ID.
+	SendText(ctx context.Context, chatID, text string) (messageID string, err error)
+
+	// SendReply sends a text message as a reply to an existing message. Returns the new message ID.
+	SendReply(ctx context.Context, parentMessageID, text string) (messageID string, err error)
 }

@@ -236,3 +236,127 @@ func (l *LarkNotifier) SendExecutionComplete(ctx context.Context, messageID stri
 	larkCard := buildCompletionCard(success, summary)
 	return l.updateCard(ctx, messageID, larkCard)
 }
+
+// SendText sends a plain text message to a chat and returns the message ID.
+//
+// The Lark IM API expects the `content` field to be a JSON-encoded string,
+// not a JSON object — so the text payload is wrapped as `{"text": "..."}`
+// and then re-marshalled to a string before being placed into the request body.
+func (l *LarkNotifier) SendText(ctx context.Context, chatID, text string) (string, error) {
+	token, err := l.getToken(ctx)
+	if err != nil {
+		return "", fmt.Errorf("get token: %w", err)
+	}
+
+	contentJSON, err := json.Marshal(map[string]string{"text": text})
+	if err != nil {
+		return "", fmt.Errorf("marshal text content: %w", err)
+	}
+
+	body, err := json.Marshal(map[string]any{
+		"receive_id": chatID,
+		"msg_type":   "text",
+		"content":    string(contentJSON),
+	})
+	if err != nil {
+		return "", fmt.Errorf("marshal message body: %w", err)
+	}
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost,
+		"https://open.feishu.cn/open-apis/im/v1/messages?receive_id_type=chat_id",
+		bytes.NewReader(body))
+	if err != nil {
+		return "", fmt.Errorf("create send request: %w", err)
+	}
+	req.Header.Set("Content-Type", "application/json; charset=utf-8")
+	req.Header.Set("Authorization", "Bearer "+token)
+
+	resp, err := l.httpClient.Do(req)
+	if err != nil {
+		return "", fmt.Errorf("send message: %w", err)
+	}
+	defer resp.Body.Close()
+
+	respBody, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return "", fmt.Errorf("read send response: %w", err)
+	}
+
+	var result struct {
+		Code int    `json:"code"`
+		Msg  string `json:"msg"`
+		Data struct {
+			MessageID string `json:"message_id"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(respBody, &result); err != nil {
+		return "", fmt.Errorf("decode send response: %w", err)
+	}
+	if result.Code != 0 {
+		return "", fmt.Errorf("lark send text API error: code=%d msg=%s", result.Code, result.Msg)
+	}
+
+	return result.Data.MessageID, nil
+}
+
+// SendReply sends a text message as a reply to an existing message and returns
+// the new message ID.
+//
+// The reply is posted at the same level as the parent (not in a thread) since
+// `reply_in_thread` is set to false. Use the parent's message ID (om_xxx) to
+// thread replies under that specific message.
+func (l *LarkNotifier) SendReply(ctx context.Context, parentMessageID, text string) (string, error) {
+	token, err := l.getToken(ctx)
+	if err != nil {
+		return "", fmt.Errorf("get token: %w", err)
+	}
+
+	contentJSON, err := json.Marshal(map[string]string{"text": text})
+	if err != nil {
+		return "", fmt.Errorf("marshal text content: %w", err)
+	}
+
+	body, err := json.Marshal(map[string]any{
+		"msg_type":        "text",
+		"content":         string(contentJSON),
+		"reply_in_thread": false,
+	})
+	if err != nil {
+		return "", fmt.Errorf("marshal reply body: %w", err)
+	}
+
+	url := fmt.Sprintf("https://open.feishu.cn/open-apis/im/v1/messages/%s/reply", parentMessageID)
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(body))
+	if err != nil {
+		return "", fmt.Errorf("create reply request: %w", err)
+	}
+	req.Header.Set("Content-Type", "application/json; charset=utf-8")
+	req.Header.Set("Authorization", "Bearer "+token)
+
+	resp, err := l.httpClient.Do(req)
+	if err != nil {
+		return "", fmt.Errorf("send reply: %w", err)
+	}
+	defer resp.Body.Close()
+
+	respBody, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return "", fmt.Errorf("read reply response: %w", err)
+	}
+
+	var result struct {
+		Code int    `json:"code"`
+		Msg  string `json:"msg"`
+		Data struct {
+			MessageID string `json:"message_id"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(respBody, &result); err != nil {
+		return "", fmt.Errorf("decode reply response: %w", err)
+	}
+	if result.Code != 0 {
+		return "", fmt.Errorf("lark reply API error: code=%d msg=%s", result.Code, result.Msg)
+	}
+
+	return result.Data.MessageID, nil
+}

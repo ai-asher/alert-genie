@@ -31,13 +31,17 @@ func NewPostgres(dsn string, maxOpen, maxIdle int, maxLifetime time.Duration) (S
 }
 
 func (s *postgresStore) Migrate(ctx context.Context) error {
-	data, err := migrationsFS.ReadFile("migrations/001_init.sql")
-	if err != nil {
-		return fmt.Errorf("read migration: %w", err)
-	}
-	_, err = s.db.ExecContext(ctx, string(data))
-	if err != nil {
-		return fmt.Errorf("run migration: %w", err)
+	migrations := []string{"migrations/001_init.sql", "migrations/002_chat.sql"}
+	for _, m := range migrations {
+		data, err := migrationsFS.ReadFile(m)
+		if err != nil {
+			return fmt.Errorf("read migration %s: %w", m, err)
+		}
+		if _, err := s.db.ExecContext(ctx, string(data)); err != nil {
+			if !isAlreadyExistsErr(err) {
+				return fmt.Errorf("run migration %s: %w", m, err)
+			}
+		}
 	}
 	return nil
 }
@@ -160,20 +164,20 @@ func (s *postgresStore) GetAnalysis(ctx context.Context, alertID string) (*Analy
 
 func (s *postgresStore) SaveApproval(ctx context.Context, a *ApprovalRecord) error {
 	_, err := s.db.ExecContext(ctx,
-		`INSERT INTO approvals (id, alert_id, plan_json, status, requested_at, lark_message_id, expires_at)
-		 VALUES ($1, $2, $3, $4, $5, $6, $7)`,
-		a.ID, a.AlertID, a.PlanJSON, a.Status, a.RequestedAt, a.LarkMessageID, a.ExpiresAt,
+		`INSERT INTO approvals (id, alert_id, plan_json, status, requested_at, lark_message_id, expires_at, parent_approval_id)
+		 VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`,
+		a.ID, a.AlertID, a.PlanJSON, a.Status, a.RequestedAt, a.LarkMessageID, a.ExpiresAt, a.ParentApprovalID,
 	)
 	return err
 }
 
 func (s *postgresStore) GetApproval(ctx context.Context, id string) (*ApprovalRecord, error) {
 	row := s.db.QueryRowContext(ctx,
-		`SELECT id, alert_id, plan_json, status, requested_at, responded_at, approver_id, approver_name, comment, lark_message_id, expires_at
+		`SELECT id, alert_id, plan_json, status, requested_at, responded_at, approver_id, approver_name, comment, lark_message_id, expires_at, COALESCE(parent_approval_id, '')
 		 FROM approvals WHERE id = $1`, id)
 	a := &ApprovalRecord{}
 	err := row.Scan(&a.ID, &a.AlertID, &a.PlanJSON, &a.Status, &a.RequestedAt, &a.RespondedAt,
-		&a.ApproverID, &a.ApproverName, &a.Comment, &a.LarkMessageID, &a.ExpiresAt)
+		&a.ApproverID, &a.ApproverName, &a.Comment, &a.LarkMessageID, &a.ExpiresAt, &a.ParentApprovalID)
 	if err == sql.ErrNoRows {
 		return nil, nil
 	}
@@ -190,7 +194,7 @@ func (s *postgresStore) UpdateApprovalStatus(ctx context.Context, id string, sta
 }
 
 func (s *postgresStore) ListApprovals(ctx context.Context, filter ApprovalFilter) ([]*ApprovalRecord, error) {
-	query := `SELECT id, alert_id, plan_json, status, requested_at, responded_at, approver_id, approver_name, comment, lark_message_id, expires_at FROM approvals WHERE 1=1`
+	query := `SELECT id, alert_id, plan_json, status, requested_at, responded_at, approver_id, approver_name, comment, lark_message_id, expires_at, COALESCE(parent_approval_id, '') FROM approvals WHERE 1=1`
 	var args []any
 	argIdx := 1
 
@@ -221,7 +225,7 @@ func (s *postgresStore) ListApprovals(ctx context.Context, filter ApprovalFilter
 	for rows.Next() {
 		a := &ApprovalRecord{}
 		if err := rows.Scan(&a.ID, &a.AlertID, &a.PlanJSON, &a.Status, &a.RequestedAt, &a.RespondedAt,
-			&a.ApproverID, &a.ApproverName, &a.Comment, &a.LarkMessageID, &a.ExpiresAt); err != nil {
+			&a.ApproverID, &a.ApproverName, &a.Comment, &a.LarkMessageID, &a.ExpiresAt, &a.ParentApprovalID); err != nil {
 			return nil, err
 		}
 		approvals = append(approvals, a)
@@ -260,4 +264,105 @@ func (s *postgresStore) ListExecutionLogs(ctx context.Context, approvalID string
 		logs = append(logs, l)
 	}
 	return logs, rows.Err()
+}
+
+// Conversations
+
+func (s *postgresStore) SaveConversation(ctx context.Context, c *Conversation) error {
+	_, err := s.db.ExecContext(ctx,
+		`INSERT INTO conversations (id, alert_id, approval_id, lark_chat_id, root_message_id, created_at, updated_at)
+		 VALUES ($1, $2, $3, $4, $5, $6, $7)`,
+		c.ID, c.AlertID, c.ApprovalID, c.LarkChatID, c.RootMessageID, c.CreatedAt, c.UpdatedAt,
+	)
+	return err
+}
+
+func (s *postgresStore) GetConversation(ctx context.Context, id string) (*Conversation, error) {
+	row := s.db.QueryRowContext(ctx,
+		`SELECT id, alert_id, COALESCE(approval_id, ''), lark_chat_id, root_message_id, created_at, updated_at
+		 FROM conversations WHERE id = $1`, id)
+	c := &Conversation{}
+	err := row.Scan(&c.ID, &c.AlertID, &c.ApprovalID, &c.LarkChatID, &c.RootMessageID, &c.CreatedAt, &c.UpdatedAt)
+	if err == sql.ErrNoRows {
+		return nil, nil
+	}
+	return c, err
+}
+
+func (s *postgresStore) GetConversationByRootMessage(ctx context.Context, rootMessageID string) (*Conversation, error) {
+	row := s.db.QueryRowContext(ctx,
+		`SELECT id, alert_id, COALESCE(approval_id, ''), lark_chat_id, root_message_id, created_at, updated_at
+		 FROM conversations WHERE root_message_id = $1`, rootMessageID)
+	c := &Conversation{}
+	err := row.Scan(&c.ID, &c.AlertID, &c.ApprovalID, &c.LarkChatID, &c.RootMessageID, &c.CreatedAt, &c.UpdatedAt)
+	if err == sql.ErrNoRows {
+		return nil, nil
+	}
+	return c, err
+}
+
+func (s *postgresStore) GetConversationByAlert(ctx context.Context, alertID string) (*Conversation, error) {
+	row := s.db.QueryRowContext(ctx,
+		`SELECT id, alert_id, COALESCE(approval_id, ''), lark_chat_id, root_message_id, created_at, updated_at
+		 FROM conversations WHERE alert_id = $1 ORDER BY created_at DESC LIMIT 1`, alertID)
+	c := &Conversation{}
+	err := row.Scan(&c.ID, &c.AlertID, &c.ApprovalID, &c.LarkChatID, &c.RootMessageID, &c.CreatedAt, &c.UpdatedAt)
+	if err == sql.ErrNoRows {
+		return nil, nil
+	}
+	return c, err
+}
+
+func (s *postgresStore) UpdateConversationApproval(ctx context.Context, id, approvalID string) error {
+	_, err := s.db.ExecContext(ctx,
+		`UPDATE conversations SET approval_id = $1, updated_at = $2 WHERE id = $3`,
+		approvalID, time.Now(), id,
+	)
+	return err
+}
+
+// Messages
+
+func (s *postgresStore) SaveMessage(ctx context.Context, m *Message) error {
+	_, err := s.db.ExecContext(ctx,
+		`INSERT INTO messages (id, conversation_id, role, content, lark_message_id, parent_lark_msg_id, user_open_id, user_name, created_at)
+		 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)`,
+		m.ID, m.ConversationID, m.Role, m.Content, m.LarkMessageID, m.ParentLarkMsgID, m.UserOpenID, m.UserName, m.CreatedAt,
+	)
+	return err
+}
+
+func (s *postgresStore) GetMessageByLarkID(ctx context.Context, larkMessageID string) (*Message, error) {
+	row := s.db.QueryRowContext(ctx,
+		`SELECT id, conversation_id, role, content, COALESCE(lark_message_id, ''), COALESCE(parent_lark_msg_id, ''), COALESCE(user_open_id, ''), COALESCE(user_name, ''), created_at
+		 FROM messages WHERE lark_message_id = $1`, larkMessageID)
+	m := &Message{}
+	err := row.Scan(&m.ID, &m.ConversationID, &m.Role, &m.Content, &m.LarkMessageID, &m.ParentLarkMsgID, &m.UserOpenID, &m.UserName, &m.CreatedAt)
+	if err == sql.ErrNoRows {
+		return nil, nil
+	}
+	return m, err
+}
+
+func (s *postgresStore) ListMessages(ctx context.Context, conversationID string, limit int) ([]*Message, error) {
+	if limit <= 0 {
+		limit = 50
+	}
+	rows, err := s.db.QueryContext(ctx,
+		`SELECT id, conversation_id, role, content, COALESCE(lark_message_id, ''), COALESCE(parent_lark_msg_id, ''), COALESCE(user_open_id, ''), COALESCE(user_name, ''), created_at
+		 FROM messages WHERE conversation_id = $1 ORDER BY created_at ASC LIMIT $2`, conversationID, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var msgs []*Message
+	for rows.Next() {
+		m := &Message{}
+		if err := rows.Scan(&m.ID, &m.ConversationID, &m.Role, &m.Content, &m.LarkMessageID, &m.ParentLarkMsgID, &m.UserOpenID, &m.UserName, &m.CreatedAt); err != nil {
+			return nil, err
+		}
+		msgs = append(msgs, m)
+	}
+	return msgs, rows.Err()
 }

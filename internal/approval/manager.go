@@ -14,6 +14,8 @@ import (
 type Manager interface {
 	// CreateApproval creates a new pending approval request.
 	CreateApproval(ctx context.Context, alertID, planJSON, larkMessageID string, ttl time.Duration) (approvalID string, err error)
+	// CreateApprovalWithParent creates a new pending approval that supersedes a previous one.
+	CreateApprovalWithParent(ctx context.Context, alertID, planJSON, larkMessageID string, ttl time.Duration, parentApprovalID string) (approvalID string, err error)
 	// ProcessCallback processes an approval callback (approve/reject/modify).
 	ProcessCallback(ctx context.Context, approvalID, action, userID string) error
 	// GetPendingApprovals returns all pending approval records.
@@ -37,6 +39,11 @@ func NewManager(st store.Store, logger *slog.Logger) Manager {
 
 // CreateApproval creates a new pending approval and persists it.
 func (m *manager) CreateApproval(ctx context.Context, alertID, planJSON, larkMessageID string, ttl time.Duration) (string, error) {
+	return m.CreateApprovalWithParent(ctx, alertID, planJSON, larkMessageID, ttl, "")
+}
+
+// CreateApprovalWithParent creates a new pending approval that may supersede a previous one.
+func (m *manager) CreateApprovalWithParent(ctx context.Context, alertID, planJSON, larkMessageID string, ttl time.Duration, parentApprovalID string) (string, error) {
 	id, err := generateUUID()
 	if err != nil {
 		return "", fmt.Errorf("generate approval ID: %w", err)
@@ -44,13 +51,14 @@ func (m *manager) CreateApproval(ctx context.Context, alertID, planJSON, larkMes
 
 	now := time.Now()
 	record := &store.ApprovalRecord{
-		ID:            id,
-		AlertID:       alertID,
-		PlanJSON:      planJSON,
-		Status:        string(StatusPending),
-		RequestedAt:   now,
-		LarkMessageID: larkMessageID,
-		ExpiresAt:     now.Add(ttl),
+		ID:               id,
+		AlertID:          alertID,
+		PlanJSON:         planJSON,
+		Status:           string(StatusPending),
+		RequestedAt:      now,
+		LarkMessageID:    larkMessageID,
+		ExpiresAt:        now.Add(ttl),
+		ParentApprovalID: parentApprovalID,
 	}
 
 	if err := m.st.SaveApproval(ctx, record); err != nil {
@@ -60,6 +68,7 @@ func (m *manager) CreateApproval(ctx context.Context, alertID, planJSON, larkMes
 	m.logger.Info("approval created",
 		slog.String("approval_id", id),
 		slog.String("alert_id", alertID),
+		slog.String("parent_approval_id", parentApprovalID),
 		slog.Time("expires_at", record.ExpiresAt),
 	)
 
