@@ -107,6 +107,61 @@ historical:
   lookback_days: 90
   min_candidates_for_llm: 2  # skip the ranker if fewer candidates than this
 
+# Runbook knowledge base. When enabled, the analyzer is fed authoritative
+# team-curated playbooks (markdown files with optional YAML frontmatter)
+# matched to the incoming alert. Unlike historical incidents (evidence),
+# runbooks are PROCEDURE — the analyzer is instructed to prefer them.
+#
+# Frontmatter format (all fields optional):
+#   ---
+#   alertnames: [HighMemoryUsage, OOMKilled]
+#   keywords: [memory, OOM, heap]
+#   tags: [k8s, pod]
+#   summary: One-line description used as the prompt excerpt
+#   ---
+#   # Title
+#   ...body...
+runbooks:
+  enabled: true
+  directory: "./configs/runbooks.example"  # walked recursively for *.md
+  reload_interval: 5m                      # how often to re-scan the directory
+  top_k: 2                                 # max runbooks fed per alert
+
+# Alert correlation / noise reduction. When enabled, alerts are buffered for
+# `window` seconds before being analyzed; alerts that share a service,
+# namespace, or instance label are grouped into a single cluster. The
+# earliest-firing alert in the cluster is treated as the primary (likely
+# root cause) and the others are attached as dependents — so a DB outage
+# producing 50 alerts results in ONE Claude analysis and ONE Lark card,
+# not 50.
+#
+# Trade-off: enabling correlation introduces up to `window` seconds of
+# extra latency per alert. Disabled by default to preserve current
+# behaviour.
+correlation:
+  enabled: false
+  window: 30s          # buffer duration; longer catches more correlated alerts
+  max_group_size: 50   # hard cap on cluster size; oversize clusters are split
+
+# Blast radius assessment. After safety validation passes for each healing
+# command, query Prometheus for objective impact signals (replica count,
+# traffic share, downstream dependents) and surface them on the approval
+# card so the human approver can see the actual scope of the change.
+#
+# Results may also flag a SuggestedRiskUpgrade — e.g. when the LLM marked a
+# command "low" but it would affect a service handling 73% of cluster
+# traffic. By default the upgrade is informational only; set
+# auto_upgrade_risk_level: true to have the pipeline overwrite the LLM's
+# RiskLevel before approval routing.
+#
+# Disabled by default to preserve current behaviour.
+blast_radius:
+  enabled: false
+  query_timeout: 5s               # per-Prometheus-query timeout (soft-fail)
+  high_traffic_threshold: 0.5     # >=50% of cluster traffic → high
+  critical_traffic_threshold: 0.8 # >=80% of cluster traffic → critical
+  auto_upgrade_risk_level: false  # surface only; don't rewrite LLM risk
+
 logging:
   level: "info"
   format: "json"

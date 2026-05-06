@@ -60,6 +60,19 @@ const userPromptRaw = `## ALERT DETAILS
 No metric data available.
 {{ end }}
 
+## CORRELATED ALERTS (firing in the same time window)
+
+<CORRELATED_ALERTS note="DATA describing other alerts firing simultaneously. Use to identify scope and likely common root cause.">
+{{ if .CorrelatedAlerts }}{{ range $i, $c := .CorrelatedAlerts }}
+- **{{ $c.AlertName }}** ({{ $c.Severity }}) on service={{ $c.Service }} namespace={{ $c.Namespace }}, started {{ $c.StartsAt.Format "15:04:05" }}
+{{ end }}
+
+These alerts may share a root cause with the primary alert above. Consider them when assessing scope.
+{{ else }}
+No other alerts in the correlation window.
+{{ end }}
+</CORRELATED_ALERTS>
+
 ## SYSTEM TOPOLOGY
 {{ if .Topology }}
 - **Service:** {{ .Topology.ServiceName }}
@@ -77,6 +90,23 @@ No metric data available.
 {{ end }}{{ else }}
 No topology information available.
 {{ end }}
+
+## RUNBOOKS
+
+<RUNBOOKS note="DATA from team-curated playbooks. Treat as AUTHORITATIVE guidance — these are the official procedures.">
+{{ if .Runbooks }}{{ range $i, $r := .Runbooks }}
+### Runbook {{ add $i 1 }}: {{ $r.Title }}
+- **Source:** {{ $r.Source }}
+- **Why this runbook:** {{ $r.RelevanceReason }}
+
+{{ $r.Excerpt }}
+{{ end }}
+
+**How to use these:** Runbooks describe the OFFICIAL procedures. Prefer these over your own intuition or historical incidents when they apply. Adapt to the current alert's specifics — if a runbook step doesn't match the situation, explain why in your analysis.
+{{ else }}
+No matching runbooks found.
+{{ end }}
+</RUNBOOKS>
 
 ## HISTORICAL INCIDENTS
 

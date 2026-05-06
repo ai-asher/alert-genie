@@ -25,7 +25,33 @@ type Config struct {
 	Store        StoreConfig        `yaml:"store"`
 	Topology     TopologyConfig     `yaml:"topology"`
 	Historical   HistoricalConfig   `yaml:"historical"`
+	Runbooks     RunbooksConfig     `yaml:"runbooks"`
+	Correlation  CorrelationConfig  `yaml:"correlation"`
+	BlastRadius  BlastRadiusConfig  `yaml:"blast_radius"`
 	Logging      LoggingConfig      `yaml:"logging"`
+}
+
+// BlastRadiusConfig governs the per-command blast radius assessor that runs
+// after safety validation passes. It is disabled by default; enabling it
+// causes the pipeline to query Prometheus for replica counts, traffic share,
+// and topology dependents before rendering the approval card.
+type BlastRadiusConfig struct {
+	// Enabled gates the entire feature. When false the pipeline skips
+	// assessment and the approval card omits the impact section.
+	Enabled bool `yaml:"enabled"`
+	// QueryTimeout caps each individual Prometheus query. Default 5s.
+	QueryTimeout time.Duration `yaml:"query_timeout"`
+	// HighTrafficThreshold (0.0-1.0) is the share of cluster traffic at or
+	// above which severity is computed as "high". Default 0.5.
+	HighTrafficThreshold float64 `yaml:"high_traffic_threshold"`
+	// CriticalTrafficThreshold (0.0-1.0) is the share at or above which
+	// severity is computed as "critical". Default 0.8.
+	CriticalTrafficThreshold float64 `yaml:"critical_traffic_threshold"`
+	// AutoUpgradeRiskLevel, when true, lets the pipeline overwrite a
+	// command's RiskLevel with the assessor's SuggestedRiskUpgrade.
+	// Default false: the upgrade is surfaced on the card but the LLM-
+	// assigned level is preserved for downstream escalation rules.
+	AutoUpgradeRiskLevel bool `yaml:"auto_upgrade_risk_level"`
 }
 
 type ServerConfig struct {
@@ -155,6 +181,42 @@ type HistoricalConfig struct {
 	TopK                int  `yaml:"top_k"`                  // # incidents fed into main prompt, default 3
 	LookbackDays        int  `yaml:"lookback_days"`          // freshness window, default 90
 	MinCandidatesForLLM int  `yaml:"min_candidates_for_llm"` // skip ranker below this, default 2
+}
+
+// RunbooksConfig controls the runbook knowledge base — markdown playbooks
+// loaded from disk and matched to alerts to feed authoritative procedure
+// snippets into the analyzer prompt.
+type RunbooksConfig struct {
+	// Enabled is the master switch. When false the retriever isn't built
+	// and the prompt's RUNBOOKS block stays empty.
+	Enabled bool `yaml:"enabled"`
+	// Directory is the absolute or working-dir-relative path to a directory
+	// containing .md runbook files. The loader walks it recursively.
+	Directory string `yaml:"directory"`
+	// ReloadInterval is how often the store re-scans Directory for changes.
+	// Set to 0 to use the 5-minute default.
+	ReloadInterval time.Duration `yaml:"reload_interval"`
+	// TopK is the maximum number of runbooks fed to the analyzer prompt
+	// per alert. Default 2 — runbooks are authoritative, so we don't need
+	// many.
+	TopK int `yaml:"top_k"`
+}
+
+// CorrelationConfig controls the alert-correlation buffer that groups
+// simultaneously-firing alerts so a single Claude analysis (and one Lark
+// card) covers the whole cluster.
+type CorrelationConfig struct {
+	// Enabled is the master switch. When false the pipeline runs in the
+	// pre-correlation per-alert flow, preserving today's behaviour exactly.
+	Enabled bool `yaml:"enabled"`
+	// Window is how long incoming alerts wait in the buffer before being
+	// grouped and dispatched. Larger windows catch more correlated alerts
+	// at the cost of higher per-alert latency. Default 30s.
+	Window time.Duration `yaml:"window"`
+	// MaxGroupSize is a hard cap on the number of alerts in a single group;
+	// oversize clusters are split into chunks. Default 50, set to 0 to
+	// disable the cap.
+	MaxGroupSize int `yaml:"max_group_size"`
 }
 
 type LoggingConfig struct {
@@ -297,5 +359,29 @@ func setDefaults(cfg *Config) {
 	}
 	if cfg.Historical.MinCandidatesForLLM == 0 {
 		cfg.Historical.MinCandidatesForLLM = 2
+	}
+	// Runbook KB defaults (only applied when enabled)
+	if cfg.Runbooks.ReloadInterval == 0 {
+		cfg.Runbooks.ReloadInterval = 5 * time.Minute
+	}
+	if cfg.Runbooks.TopK == 0 {
+		cfg.Runbooks.TopK = 2
+	}
+	// Correlation defaults (only applied when enabled)
+	if cfg.Correlation.Window == 0 {
+		cfg.Correlation.Window = 30 * time.Second
+	}
+	if cfg.Correlation.MaxGroupSize == 0 {
+		cfg.Correlation.MaxGroupSize = 50
+	}
+	// Blast radius defaults (only meaningful when enabled)
+	if cfg.BlastRadius.QueryTimeout == 0 {
+		cfg.BlastRadius.QueryTimeout = 5 * time.Second
+	}
+	if cfg.BlastRadius.HighTrafficThreshold == 0 {
+		cfg.BlastRadius.HighTrafficThreshold = 0.5
+	}
+	if cfg.BlastRadius.CriticalTrafficThreshold == 0 {
+		cfg.BlastRadius.CriticalTrafficThreshold = 0.8
 	}
 }

@@ -12,11 +12,14 @@ import (
 	"github.com/alert-genie/alert-genie/internal/alert"
 	"github.com/alert-genie/alert-genie/internal/analyzer"
 	"github.com/alert-genie/alert-genie/internal/approval"
+	"github.com/alert-genie/alert-genie/internal/blastradius"
 	"github.com/alert-genie/alert-genie/internal/config"
+	"github.com/alert-genie/alert-genie/internal/correlation"
 	"github.com/alert-genie/alert-genie/internal/executor"
 	"github.com/alert-genie/alert-genie/internal/incidents"
 	"github.com/alert-genie/alert-genie/internal/metrics"
 	"github.com/alert-genie/alert-genie/internal/notifier"
+	"github.com/alert-genie/alert-genie/internal/runbooks"
 	"github.com/alert-genie/alert-genie/internal/safety"
 	"github.com/alert-genie/alert-genie/internal/store"
 	"github.com/alert-genie/alert-genie/internal/topology"
@@ -24,21 +27,25 @@ import (
 
 // Pipeline orchestrates the alert-to-action flow.
 type Pipeline struct {
-	cfg       *config.Config
-	fetcher   metrics.Fetcher
-	analyzer  analyzer.Analyzer
-	safety    safety.Validator
-	approval  approval.Manager
-	router    *executor.Router
-	notifier  notifier.Notifier
-	store     store.Store
-	topology  topology.Provider
-	retriever incidents.Retriever
-	logger    *slog.Logger
+	cfg         *config.Config
+	fetcher     metrics.Fetcher
+	analyzer    analyzer.Analyzer
+	safety      safety.Validator
+	approval    approval.Manager
+	router      *executor.Router
+	notifier    notifier.Notifier
+	store       store.Store
+	topology    topology.Provider
+	retriever   incidents.Retriever
+	runbooks    runbooks.Retriever
+	correlator  *correlation.Correlator
+	blastRadius blastradius.Assessor
+	logger      *slog.Logger
 }
 
 // New creates a new Pipeline with all dependencies injected.
-// retriever may be nil — in that case historical context enrichment is skipped.
+// retriever, runbooksR, correlator, and blastR may all be nil — those
+// features simply skip their pass when their dependency is absent.
 func New(
 	cfg *config.Config,
 	fetcher metrics.Fetcher,
@@ -50,32 +57,138 @@ func New(
 	st store.Store,
 	tp topology.Provider,
 	retriever incidents.Retriever,
+	runbooksR runbooks.Retriever,
+	correlator *correlation.Correlator,
+	blastR blastradius.Assessor,
 	logger *slog.Logger,
 ) *Pipeline {
 	return &Pipeline{
-		cfg:       cfg,
-		fetcher:   fetcher,
-		analyzer:  az,
-		safety:    sv,
-		approval:  am,
-		router:    router,
-		notifier:  n,
-		store:     st,
-		topology:  tp,
-		retriever: retriever,
-		logger:    logger,
+		cfg:         cfg,
+		fetcher:     fetcher,
+		analyzer:    az,
+		safety:      sv,
+		approval:    am,
+		router:      router,
+		notifier:    n,
+		store:       st,
+		topology:    tp,
+		retriever:   retriever,
+		runbooks:    runbooksR,
+		correlator:  correlator,
+		blastRadius: blastR,
+		logger:      logger,
 	}
+}
+
+// SetCorrelator wires in a correlator after pipeline construction. This is
+// done as a setter (instead of a constructor argument) because the
+// correlator's onGroup callback needs to reference pipeline.processGroup,
+// creating a circular dependency that's cleanest to break post-construction.
+func (p *Pipeline) SetCorrelator(c *correlation.Correlator) {
+	p.correlator = c
+}
+
+// ProcessGroup is exported so main.go can pass it as the correlator's
+// onGroup callback.
+func (p *Pipeline) ProcessGroup(ctx context.Context, group correlation.Group) {
+	p.processGroup(ctx, group)
 }
 
 // ProcessAlert is the main entry point called by the alert handler's ProcessFunc.
 // Each alert in the payload is processed asynchronously with its assigned UUID.
+//
+// When the correlator is configured, alerts are routed through it for grouping;
+// otherwise each alert goes straight to processOne, preserving pre-correlation
+// behavior exactly.
 func (p *Pipeline) ProcessAlert(ctx context.Context, payload alert.WebhookPayload, persisted []alert.PersistedAlert) {
+	if p.correlator != nil {
+		// Hand alerts to the correlator. It will buffer them for the configured
+		// window and call back via processGroup once a cluster is finalized.
+		// We cache payload-level context (CommonLabels, GeneratorURL) on the
+		// Alert struct since the correlator's onGroup callback won't see the
+		// original webhook payload.
+		for _, pa := range persisted {
+			p.correlator.Submit(ctx, toCorrelationAlert(pa.ID, pa.Alert))
+		}
+		return
+	}
+
 	for _, pa := range persisted {
 		go p.processOne(context.Background(), pa.ID, pa.Alert, payload)
 	}
 }
 
+// processGroup is the correlator's onGroup callback. It runs the existing
+// per-alert processing flow on the group's primary, attaching the dependents
+// as additional context for the analyzer and the rendered card.
+func (p *Pipeline) processGroup(ctx context.Context, group correlation.Group) {
+	primary := group.Primary
+	dependents := make([]correlation.Alert, 0, len(group.Dependents))
+	dependents = append(dependents, group.Dependents...)
+
+	// Reconstruct an alert.Alert and (best-effort) wrap an empty payload
+	// for processOne. The original webhook payload isn't available here,
+	// but processOne only uses payload.GroupKey, payload.Alerts (count),
+	// and payload.CommonLabels — none of which are critical for analysis.
+	a := fromCorrelationAlert(primary)
+	payload := alert.WebhookPayload{
+		GroupKey:     "correlation:" + group.GroupID,
+		Alerts:       []alert.Alert{a},
+		CommonLabels: map[string]string{},
+	}
+
+	if len(dependents) > 0 {
+		p.logger.Info("processing correlated group",
+			"primary_alert_id", primary.ID,
+			"primary_alertname", primary.AlertName,
+			"dependents", len(dependents),
+			"reason", group.CorrelationReason,
+		)
+	}
+
+	p.processOneWithCorrelation(context.Background(), primary.ID, a, payload, dependents)
+}
+
 func (p *Pipeline) processOne(ctx context.Context, alertID string, a alert.Alert, payload alert.WebhookPayload) {
+	p.processOneWithCorrelation(ctx, alertID, a, payload, nil)
+}
+
+// toCorrelationAlert converts a persisted alert into the correlator's view.
+func toCorrelationAlert(alertID string, a alert.Alert) correlation.Alert {
+	service := a.Labels["service"]
+	if service == "" {
+		service = a.Labels["job"]
+	}
+	return correlation.Alert{
+		ID:          alertID,
+		Fingerprint: a.Fingerprint,
+		AlertName:   a.AlertName(),
+		Severity:    a.Severity(),
+		Service:     service,
+		Namespace:   a.Labels["namespace"],
+		Instance:    a.Labels["instance"],
+		Labels:      a.Labels,
+		Annotations: a.Annotations,
+		StartsAt:    a.StartsAt,
+	}
+}
+
+// fromCorrelationAlert reconstructs an alert.Alert from the correlator view.
+func fromCorrelationAlert(c correlation.Alert) alert.Alert {
+	return alert.Alert{
+		Status:      "firing",
+		Labels:      c.Labels,
+		Annotations: c.Annotations,
+		StartsAt:    c.StartsAt,
+		Fingerprint: c.Fingerprint,
+	}
+}
+
+// processOneWithCorrelation runs the full analysis pipeline on a single alert.
+// When dependents is non-empty, the alert is treated as the primary of a
+// correlation cluster and dependents are surfaced to both the analyzer prompt
+// and the rendered Lark card.
+func (p *Pipeline) processOneWithCorrelation(ctx context.Context, alertID string, a alert.Alert, payload alert.WebhookPayload, dependents []correlation.Alert) {
 	alertName := a.AlertName()
 	p.logger.Info("pipeline processing alert",
 		"alert_id", alertID,
@@ -103,6 +216,12 @@ func (p *Pipeline) processOne(ctx context.Context, alertID string, a alert.Alert
 	// best-effort — failures degrade gracefully to "no historical context".
 	historical := p.fetchHistorical(ctx, alertID, a)
 
+	// 3.6. Fetch matching runbooks (authoritative team-curated procedures).
+	rb := p.fetchRunbooks(ctx, a)
+
+	// 3.7. Convert correlation dependents into the analyzer's view.
+	correlated := toAnalyzerCorrelated(dependents)
+
 	req := analyzer.AnalysisRequest{
 		AlertName:           alertName,
 		AlertStatus:         a.Status,
@@ -119,6 +238,8 @@ func (p *Pipeline) processOne(ctx context.Context, alertID string, a alert.Alert
 		Topology:            topoCtx,
 		Mode:                analyzer.Mode(p.cfg.Mode),
 		HistoricalIncidents: historical,
+		Runbooks:            rb,
+		CorrelatedAlerts:    correlated,
 	}
 
 	// 4. Call LLM for analysis
@@ -147,8 +268,10 @@ func (p *Pipeline) processOne(ctx context.Context, alertID string, a alert.Alert
 		CreatedAt:    time.Now(),
 	})
 
-	// 6. Build notification card from analysis result
+	// 6. Build notification card from analysis result and attach dependents
+	// (so the card shows "🔗 N other alerts correlated with this one").
 	card := buildAnalysisCard(result)
+	card.Dependents = toCardDependents(dependents)
 
 	// 7. Branch: ReadOnly vs Healing
 	if p.cfg.Mode == "readonly" || result.HealingPlan == nil {
@@ -192,8 +315,13 @@ func (p *Pipeline) processOne(ctx context.Context, alertID string, a alert.Alert
 			"One or more commands were blocked by the safety system. Review the plan carefully.")
 	}
 
+	// 8.5. Compute blast radius for each command. Best-effort; failures
+	// degrade to "📊 Impact: insufficient data" on the card.
+	blastResults := p.assessBlastRadius(ctx, plan)
+
 	// 9. Send healing plan card with approve/reject buttons
 	healingCard := buildHealingPlanCard(result, card)
+	attachBlastRadius(&healingCard, blastResults)
 
 	msgID, err := p.notifier.SendHealingPlan(ctx, healingCard)
 	if err != nil {
@@ -426,6 +554,155 @@ func (p *Pipeline) fetchHistorical(ctx context.Context, alertID string, a alert.
 	p.logger.Info("historical incidents retrieved",
 		"alertname", a.AlertName(), "count", len(out))
 	return out
+}
+
+// fetchRunbooks looks up matching team-curated runbooks for the alert.
+// Best-effort — runbook KB unavailable / errors degrade to nil.
+func (p *Pipeline) fetchRunbooks(ctx context.Context, a alert.Alert) []analyzer.RunbookSnippet {
+	if p.runbooks == nil {
+		return nil
+	}
+	q := runbooks.Query{
+		AlertName:   a.AlertName(),
+		Severity:    a.Severity(),
+		Labels:      a.Labels,
+		Annotations: a.Annotations,
+	}
+	snippets, err := p.runbooks.Retrieve(ctx, q)
+	if err != nil {
+		p.logger.Warn("runbook retrieval failed, continuing without it",
+			"alertname", a.AlertName(), "error", err)
+		return nil
+	}
+	if len(snippets) == 0 {
+		return nil
+	}
+	out := make([]analyzer.RunbookSnippet, 0, len(snippets))
+	for _, s := range snippets {
+		out = append(out, analyzer.RunbookSnippet{
+			Title:           s.Title,
+			Source:          s.Source,
+			RelevanceReason: s.RelevanceReason,
+			Excerpt:         s.Excerpt,
+		})
+	}
+	p.logger.Info("runbooks matched", "alertname", a.AlertName(), "count", len(out))
+	return out
+}
+
+// toAnalyzerCorrelated converts correlation alerts into the analyzer view.
+func toAnalyzerCorrelated(deps []correlation.Alert) []analyzer.CorrelatedAlert {
+	if len(deps) == 0 {
+		return nil
+	}
+	out := make([]analyzer.CorrelatedAlert, 0, len(deps))
+	for _, d := range deps {
+		out = append(out, analyzer.CorrelatedAlert{
+			AlertName:   d.AlertName,
+			Severity:    d.Severity,
+			Service:     d.Service,
+			Namespace:   d.Namespace,
+			StartsAt:    d.StartsAt,
+			Annotations: d.Annotations,
+		})
+	}
+	return out
+}
+
+// toCardDependents converts correlation alerts into the notifier card view.
+func toCardDependents(deps []correlation.Alert) []notifier.DependentAlertSummary {
+	if len(deps) == 0 {
+		return nil
+	}
+	out := make([]notifier.DependentAlertSummary, 0, len(deps))
+	for _, d := range deps {
+		out = append(out, notifier.DependentAlertSummary{
+			AlertName: d.AlertName,
+			Severity:  d.Severity,
+			Service:   d.Service,
+			Namespace: d.Namespace,
+		})
+	}
+	return out
+}
+
+// assessBlastRadius computes per-command blast radius for the plan.
+// Returns a map keyed by command step number. Nil if assessor disabled.
+func (p *Pipeline) assessBlastRadius(ctx context.Context, plan *analyzer.HealingPlan) map[int]*blastradius.Assessment {
+	if p.blastRadius == nil || plan == nil || len(plan.Commands) == 0 {
+		return nil
+	}
+	results := make(map[int]*blastradius.Assessment, len(plan.Commands))
+	for i, cmd := range plan.Commands {
+		brCmd := blastradius.Command{
+			ID:           fmt.Sprintf("cmd-%d", cmd.Step),
+			Step:         cmd.Step,
+			CommandType:  cmd.CommandType,
+			Target:       cmd.Target,
+			Namespace:    cmd.Namespace,
+			Command:      cmd.Command,
+			Args:         cmd.Args,
+			LLMRiskLevel: cmd.RiskLevel,
+		}
+		assessment, err := p.blastRadius.Assess(ctx, brCmd)
+		if err != nil {
+			p.logger.Warn("blast radius assessment failed",
+				"step", cmd.Step, "command", cmd.Command, "error", err)
+			continue
+		}
+		results[cmd.Step] = assessment
+
+		// Optionally upgrade the LLM-assigned risk level. Off by default
+		// (cfg.BlastRadius.AutoUpgradeRiskLevel); we always surface the
+		// upgrade hint on the card so humans see it either way.
+		if p.cfg.BlastRadius.AutoUpgradeRiskLevel && assessment.SuggestedRiskUpgrade != "" {
+			p.logger.Warn("blast radius auto-upgrading command risk",
+				"step", cmd.Step,
+				"from", cmd.RiskLevel,
+				"to", assessment.SuggestedRiskUpgrade,
+			)
+			plan.Commands[i].RiskLevel = assessment.SuggestedRiskUpgrade
+		}
+	}
+	return results
+}
+
+// attachBlastRadius copies blast-radius assessments onto healingCard's commands.
+func attachBlastRadius(healingCard *notifier.HealingPlanCard, results map[int]*blastradius.Assessment) {
+	if results == nil {
+		return
+	}
+	for i, cc := range healingCard.Commands {
+		a, ok := results[cc.Step]
+		if !ok || a == nil {
+			continue
+		}
+		findings := make([]string, 0, len(a.Findings))
+		for _, f := range a.Findings {
+			findings = append(findings, f.Message)
+		}
+		dependentCount := len(a.DependentServices)
+		upgrade := ""
+		if a.SuggestedRiskUpgrade != "" {
+			// Format depends on what info we have; keep it short.
+			reason := "blast radius signals exceeded threshold"
+			for _, f := range a.Findings {
+				if f.Kind == "traffic" {
+					reason = f.Message
+					break
+				}
+			}
+			upgrade = fmt.Sprintf("→ %s (%s)", a.SuggestedRiskUpgrade, reason)
+		}
+		healingCard.Commands[i].BlastRadius = &notifier.CommandBlastRadius{
+			Severity:              a.OverallSeverity,
+			EstimatedReplicas:     a.EstimatedReplicasAffected,
+			EstimatedTrafficPct:   a.EstimatedTrafficShareBps * 100,
+			DependentServiceCount: dependentCount,
+			Findings:              findings,
+			UpgradedFromLLM:       upgrade,
+		}
+	}
 }
 
 func (p *Pipeline) fetchMetrics(ctx context.Context, a alert.Alert) []metrics.MetricSeries {

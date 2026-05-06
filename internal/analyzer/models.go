@@ -37,6 +37,40 @@ type AnalysisRequest struct {
 	// resolved. Optional — when empty the prompt simply omits the section.
 	// Each incident is a compact summary; full details live in the store.
 	HistoricalIncidents []HistoricalIncident
+
+	// CorrelatedAlerts lists other alerts firing in the same cluster as the
+	// primary one (the alert this request is for). Helps the LLM identify
+	// the scope and likely common root cause of an incident. Optional — when
+	// empty the prompt omits the section.
+	CorrelatedAlerts []CorrelatedAlert
+
+	// Runbooks is the set of authoritative team-curated playbooks matched
+	// to the alert. Empty when the runbook KB is disabled or no match
+	// found. Unlike HistoricalIncidents (evidence), these are PROCEDURE
+	// and the prompt instructs the analyzer to prefer them.
+	Runbooks []RunbookSnippet
+}
+
+// RunbookSnippet mirrors runbooks.RunbookSnippet but lives here to avoid a
+// direct dependency from analyzer onto the runbooks package (data flows in
+// one direction: pipeline -> retriever -> analyzer).
+type RunbookSnippet struct {
+	Title           string
+	Source          string
+	RelevanceReason string
+	Excerpt         string
+}
+
+// CorrelatedAlert is a compact summary of a non-primary alert in a correlation
+// cluster, fed to the analyzer so it can reason about incident scope without
+// running an analysis per alert.
+type CorrelatedAlert struct {
+	AlertName   string
+	Severity    string
+	Service     string
+	Namespace   string
+	StartsAt    time.Time
+	Annotations map[string]string
 }
 
 // HistoricalIncident is a compact past-incident reference fed to the analyzer.

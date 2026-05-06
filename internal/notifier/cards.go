@@ -81,6 +81,12 @@ func buildAnalysisCard(card AnalysisCard) map[string]any {
 		elements = append(elements, divider())
 	}
 
+	// Correlated dependent alerts section.
+	if section := buildDependentsSection(card.Dependents); section != "" {
+		elements = append(elements, markdownElement(section))
+		elements = append(elements, divider())
+	}
+
 	// Footer: confidence, timestamp, model info
 	footerParts := []string{
 		fmt.Sprintf("Confidence: **%.0f%%**", card.Confidence*100),
@@ -133,6 +139,9 @@ func buildHealingPlanCard(card HealingPlanCard) map[string]any {
 				"%d. %s [%s]\n   `%s` → %s (timeout: %ds, risk: %s)",
 				c.Step, c.Description, c.CommandType, c.Command, c.Target, c.TimeoutSec, riskBadge(c.RiskLevel),
 			))
+			if impact := renderBlastRadius(c.BlastRadius); impact != "" {
+				lines = append(lines, impact)
+			}
 		}
 		elements = append(elements, markdownElement(strings.Join(lines, "\n")))
 		elements = append(elements, divider())
@@ -146,6 +155,12 @@ func buildHealingPlanCard(card HealingPlanCard) map[string]any {
 			lines = append(lines, fmt.Sprintf("- %s", w))
 		}
 		elements = append(elements, markdownElement(strings.Join(lines, "\n")))
+		elements = append(elements, divider())
+	}
+
+	// Correlated dependent alerts section.
+	if section := buildDependentsSection(card.Dependents); section != "" {
+		elements = append(elements, markdownElement(section))
 		elements = append(elements, divider())
 	}
 
@@ -377,6 +392,98 @@ func buildFeedbackCard(c FeedbackCard) map[string]any {
 		},
 		"elements": elements,
 	}
+}
+
+// buildDependentsSection renders the collapsed list of correlated dependent
+// alerts shown on analysis and healing-plan cards. Returns "" when there are
+// no dependents so callers can skip emitting an empty element.
+//
+// The list is truncated to maxDependentsShown entries; if there are more, an
+// overflow note ("…and N more") is appended so users know the full count
+// without flooding the card.
+func buildDependentsSection(deps []DependentAlertSummary) string {
+	const maxDependentsShown = 5
+	if len(deps) == 0 {
+		return ""
+	}
+	var lines []string
+	lines = append(lines, fmt.Sprintf("### 🔗 %d other alert(s) correlated with this one", len(deps)))
+	limit := len(deps)
+	if limit > maxDependentsShown {
+		limit = maxDependentsShown
+	}
+	for i := 0; i < limit; i++ {
+		d := deps[i]
+		loc := ""
+		if d.Service != "" && d.Namespace != "" {
+			loc = fmt.Sprintf(" on %s/%s", d.Service, d.Namespace)
+		} else if d.Service != "" {
+			loc = " on " + d.Service
+		} else if d.Namespace != "" {
+			loc = " in " + d.Namespace
+		}
+		lines = append(lines, fmt.Sprintf("- **%s** (%s)%s", d.AlertName, d.Severity, loc))
+	}
+	if len(deps) > maxDependentsShown {
+		lines = append(lines, fmt.Sprintf("- …and %d more", len(deps)-maxDependentsShown))
+	}
+	return strings.Join(lines, "\n")
+}
+
+// renderBlastRadius produces the per-command "📊 Impact:" markdown block for
+// the healing plan card. Returns an empty string when br is nil so callers
+// can simply concatenate without extra branches.
+//
+// The block format is:
+//
+//	📊 Impact: <severity>, ~<X>% traffic, <N> replicas, <D> dependents
+//	- finding 1
+//	- finding 2
+//	⚠️ Risk upgraded: low → high (reason: ...)
+//
+// Only the top two findings are rendered to keep the card compact; the rest
+// are summarized as "(+N more)".
+func renderBlastRadius(br *CommandBlastRadius) string {
+	if br == nil {
+		return ""
+	}
+	var b strings.Builder
+	// Headline summary line.
+	b.WriteString("   📊 Impact: ")
+	parts := []string{riskBadge(br.Severity)}
+	if br.EstimatedTrafficPct > 0 {
+		parts = append(parts, fmt.Sprintf("~%.1f%% traffic", br.EstimatedTrafficPct))
+	}
+	if br.EstimatedReplicas > 0 {
+		parts = append(parts, fmt.Sprintf("%d replica(s)", br.EstimatedReplicas))
+	}
+	if br.DependentServiceCount > 0 {
+		parts = append(parts, fmt.Sprintf("%d dependent(s)", br.DependentServiceCount))
+	}
+	b.WriteString(strings.Join(parts, " | "))
+
+	// Top two findings as bullets; squash the rest into a counter.
+	if len(br.Findings) > 0 {
+		max := 2
+		if len(br.Findings) < max {
+			max = len(br.Findings)
+		}
+		for i := 0; i < max; i++ {
+			b.WriteString("\n   - ")
+			b.WriteString(br.Findings[i])
+		}
+		if len(br.Findings) > max {
+			b.WriteString(fmt.Sprintf("\n   - (+%d more finding(s))", len(br.Findings)-max))
+		}
+	} else {
+		b.WriteString("\n   - insufficient data")
+	}
+
+	if br.UpgradedFromLLM != "" {
+		b.WriteString("\n   ⚠️ Risk upgraded: ")
+		b.WriteString(br.UpgradedFromLLM)
+	}
+	return b.String()
 }
 
 // markdownElement creates a Lark card markdown element.

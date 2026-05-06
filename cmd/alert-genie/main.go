@@ -13,13 +13,16 @@ import (
 	"github.com/alert-genie/alert-genie/internal/alert"
 	"github.com/alert-genie/alert-genie/internal/analyzer"
 	"github.com/alert-genie/alert-genie/internal/approval"
+	"github.com/alert-genie/alert-genie/internal/blastradius"
 	"github.com/alert-genie/alert-genie/internal/chat"
 	"github.com/alert-genie/alert-genie/internal/config"
+	"github.com/alert-genie/alert-genie/internal/correlation"
 	"github.com/alert-genie/alert-genie/internal/executor"
 	"github.com/alert-genie/alert-genie/internal/incidents"
 	"github.com/alert-genie/alert-genie/internal/metrics"
 	"github.com/alert-genie/alert-genie/internal/notifier"
 	"github.com/alert-genie/alert-genie/internal/pipeline"
+	"github.com/alert-genie/alert-genie/internal/runbooks"
 	"github.com/alert-genie/alert-genie/internal/safety"
 	"github.com/alert-genie/alert-genie/internal/server"
 	"github.com/alert-genie/alert-genie/internal/store"
@@ -121,9 +124,19 @@ func main() {
 
 	router := executor.NewRouter(executors, st, larkNotifier, logger)
 
-	// Initialize pipeline
+	// Build optional enrichment components. Each returns nil when disabled.
+	historicalRetriever := buildRetriever(st, az, cfg, logger)
+	runbookRetriever := buildRunbookRetriever(cfg, logger)
+	blastRadiusAssessor := buildBlastRadiusAssessor(fetcher, topo, cfg, logger)
+
+	// Pipeline first; the correlator's onGroup callback needs to reference
+	// pipeline.processGroup, so we construct the pipeline with a nil correlator,
+	// then build the correlator (if enabled) referencing pipe, and inject it back.
 	pipe := pipeline.New(cfg, fetcher, az, sv, am, router, larkNotifier, st, topo,
-		buildRetriever(st, az, cfg, logger), logger)
+		historicalRetriever, runbookRetriever, nil, blastRadiusAssessor, logger)
+
+	correlator := buildCorrelator(cfg, topo, pipe, logger)
+	pipe.SetCorrelator(correlator)
 
 	// Initialize alert handler
 	dedup := alert.NewDeduplicator(cfg.Alertmanager.DedupWindow)
@@ -169,6 +182,12 @@ func main() {
 	defer stop()
 
 	pipe.StartExpireLoop(ctx)
+
+	// Start the alert correlator background loop if it was built
+	if correlator != nil {
+		correlator.Start(ctx)
+		defer correlator.Stop()
+	}
 
 	// Start server
 	go func() {
@@ -217,6 +236,72 @@ func buildRetriever(st store.Store, az analyzer.Analyzer, cfg *config.Config, lo
 		LookbackDays:        cfg.Historical.LookbackDays,
 		MinCandidatesForLLM: cfg.Historical.MinCandidatesForLLM,
 		Enabled:             true,
+	}, logger)
+}
+
+// buildRunbookRetriever constructs the runbook KB and starts its background
+// reload loop, returning a Retriever or nil when disabled.
+func buildRunbookRetriever(cfg *config.Config, logger *slog.Logger) runbooks.Retriever {
+	if !cfg.Runbooks.Enabled || cfg.Runbooks.Directory == "" {
+		logger.Info("runbook KB disabled (set runbooks.enabled: true and runbooks.directory to enable)")
+		return nil
+	}
+	logger.Info("runbook KB enabled",
+		"directory", cfg.Runbooks.Directory,
+		"reload_interval", cfg.Runbooks.ReloadInterval,
+		"top_k", cfg.Runbooks.TopK,
+	)
+	loader := runbooks.NewFSLoader(cfg.Runbooks.Directory)
+	st := runbooks.NewStore(loader, logger)
+	if err := st.Start(context.Background(), cfg.Runbooks.ReloadInterval); err != nil {
+		logger.Warn("initial runbook load failed; KB starts empty",
+			"error", err, "directory", cfg.Runbooks.Directory)
+	}
+	return runbooks.NewRetriever(st, runbooks.Config{
+		Enabled:         true,
+		TopK:            cfg.Runbooks.TopK,
+		MaxExcerptChars: 2000,
+	})
+}
+
+// buildCorrelator builds the alert correlator if enabled. nil otherwise.
+// The pipe is needed because the correlator's onGroup callback is
+// pipe.ProcessGroup.
+func buildCorrelator(cfg *config.Config, topo topology.Provider, pipe *pipeline.Pipeline, logger *slog.Logger) *correlation.Correlator {
+	if !cfg.Correlation.Enabled {
+		logger.Info("alert correlation disabled (set correlation.enabled: true to enable)")
+		return nil
+	}
+	logger.Info("alert correlation enabled",
+		"window", cfg.Correlation.Window,
+		"max_group_size", cfg.Correlation.MaxGroupSize,
+	)
+	return correlation.New(
+		cfg.Correlation.Window,
+		cfg.Correlation.MaxGroupSize,
+		topo,
+		pipe.ProcessGroup,
+		logger,
+	)
+}
+
+// buildBlastRadiusAssessor constructs the blast-radius assessor if enabled.
+func buildBlastRadiusAssessor(fetcher metrics.Fetcher, topo topology.Provider, cfg *config.Config, logger *slog.Logger) blastradius.Assessor {
+	if !cfg.BlastRadius.Enabled {
+		logger.Info("blast radius assessor disabled (set blast_radius.enabled: true to enable)")
+		return nil
+	}
+	logger.Info("blast radius assessor enabled",
+		"query_timeout", cfg.BlastRadius.QueryTimeout,
+		"high_traffic_threshold", cfg.BlastRadius.HighTrafficThreshold,
+		"critical_traffic_threshold", cfg.BlastRadius.CriticalTrafficThreshold,
+		"auto_upgrade_risk_level", cfg.BlastRadius.AutoUpgradeRiskLevel,
+	)
+	return blastradius.New(fetcher, topo, blastradius.Config{
+		Enabled:                  true,
+		PrometheusQueryTimeout:   cfg.BlastRadius.QueryTimeout,
+		HighTrafficThreshold:     cfg.BlastRadius.HighTrafficThreshold,
+		CriticalTrafficThreshold: cfg.BlastRadius.CriticalTrafficThreshold,
 	}, logger)
 }
 
